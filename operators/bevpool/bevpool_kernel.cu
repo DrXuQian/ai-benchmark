@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <algorithm>
 #include "bevpool_kernel.h"
 
 #define checkCudaErrors(val) check((val), #val, __FILE__, __LINE__)
@@ -46,16 +47,24 @@ static __global__ void bevpool_half_pack10_kernel(
         float depth_weight = __half2float(depth_weights[indice]);
         unsigned int camera_feature_offset = (camera_index * farea + fm_inner_index) * nchannel + feature_block;
         
-        combined_half feature = *(combined_half*)(camera_feature + camera_feature_offset);
-
-        #pragma unroll
-        for (int j = 0; j < tile_size; j++) {
-            accumulate[j] = fma(__half2float(feature.val[j]), depth_weight, accumulate[j]);
+        // Check if we can safely access a full tile_size block
+        if (feature_block + tile_size <= nchannel) {
+            combined_half feature = *(combined_half*)(camera_feature + camera_feature_offset);
+            #pragma unroll
+            for (int j = 0; j < tile_size; j++) {
+                accumulate[j] = fma(__half2float(feature.val[j]), depth_weight, accumulate[j]);
+            }
+        } else {
+            // Handle remaining channels individually
+            for (int j = 0; j < tile_size && (feature_block + j) < nchannel; j++) {
+                half feature_val = camera_feature[camera_feature_offset + j];
+                accumulate[j] = fma(__half2float(feature_val), depth_weight, accumulate[j]);
+            }
         }
     }
 
     #pragma unroll
-    for (int j = 0; j < tile_size; j++) {
+    for (int j = 0; j < tile_size && (feature_block + j) < nchannel; j++) {
         unsigned int output_offset = interval.z + (feature_block + j) * out_h * out_w;
         output_bevfeat[output_offset] = __float2half(accumulate[j]);
     }
@@ -102,8 +111,8 @@ half* bevpool_forward(
     unsigned int H = pool->params.feature_height;
     unsigned int W = pool->params.feature_width;
 
-    int thread_x = C / tile_size;
-    int thread_y = 1024 / thread_x;
+    int thread_x = (C + tile_size - 1) / tile_size;  // Round up division
+    int thread_y = (1024 / thread_x) < 32 ? (1024 / thread_x) : 32;  // Limit thread_y to avoid too large block size
     dim3 threads(thread_x, thread_y);
     dim3 blocks(1, (num_intervals + thread_y - 1) / thread_y);
     

@@ -53,7 +53,7 @@ public:
         params.feature_height = params_dict["feature_height"];
         params.feature_width = params_dict["feature_width"];
         params.camera_shape = {
-            params.num_cameras,
+            (int)params.num_cameras,
             (int)params.channels,
             (int)params.depth_bins,
             (int)params.feature_height,
@@ -136,9 +136,15 @@ torch::Tensor bevpool_forward_wrapper(
     return pool->forward(camera_features, depth_weights, indices, intervals);
 }
 
+void bevpool_destroy_wrapper(std::shared_ptr<BEVPoolWrapper> pool) {
+    // The destructor will be called automatically when the shared_ptr is destroyed
+    pool.reset();
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    py::class_<BEVPoolWrapper>(m, "BEVPoolWrapper");
+    py::class_<BEVPoolWrapper, std::shared_ptr<BEVPoolWrapper>>(m, "BEVPoolWrapper");
     
     m.def("create", &bevpool_create_wrapper, "Create BEVPool instance");
     m.def("forward", &bevpool_forward_wrapper, "BEVPool forward");
+    m.def("destroy", &bevpool_destroy_wrapper, "Destroy BEVPool instance");
 }
