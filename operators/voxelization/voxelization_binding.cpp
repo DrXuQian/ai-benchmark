@@ -3,6 +3,8 @@
 #include <cuda_fp16.h>
 #include <vector>
 #include <iostream>
+#include <algorithm>
+#include <climits>
 
 // Forward declarations
 struct VoxelParams {
@@ -33,7 +35,7 @@ extern "C" void voxelizationLaunch(
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> voxelization_forward(
     torch::Tensor points,
-    std::map<std::string, float> voxel_params_dict
+    std::map<std::string, double> voxel_params_dict
 ) {
     // Check inputs
     TORCH_CHECK(points.is_cuda(), "Points must be a CUDA tensor");
@@ -46,15 +48,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> voxelization_forward(
     
     // Setup voxel parameters
     VoxelParams params;
-    params.min_x_range = voxel_params_dict["min_x_range"];
-    params.max_x_range = voxel_params_dict["max_x_range"];
-    params.min_y_range = voxel_params_dict["min_y_range"];
-    params.max_y_range = voxel_params_dict["max_y_range"];
-    params.min_z_range = voxel_params_dict["min_z_range"];
-    params.max_z_range = voxel_params_dict["max_z_range"];
-    params.voxel_x_size = voxel_params_dict["voxel_x_size"];
-    params.voxel_y_size = voxel_params_dict["voxel_y_size"];
-    params.voxel_z_size = voxel_params_dict["voxel_z_size"];
+    params.min_x_range = (float)voxel_params_dict["min_x_range"];
+    params.max_x_range = (float)voxel_params_dict["max_x_range"];
+    params.min_y_range = (float)voxel_params_dict["min_y_range"];
+    params.max_y_range = (float)voxel_params_dict["max_y_range"];
+    params.min_z_range = (float)voxel_params_dict["min_z_range"];
+    params.max_z_range = (float)voxel_params_dict["max_z_range"];
+    params.voxel_x_size = (float)voxel_params_dict["voxel_x_size"];
+    params.voxel_y_size = (float)voxel_params_dict["voxel_y_size"];
+    params.voxel_z_size = (float)voxel_params_dict["voxel_z_size"];
     params.max_points_per_voxel = (int)voxel_params_dict["max_points_per_voxel"];
     params.grid_x_size = (int)voxel_params_dict["grid_x_size"];
     params.grid_y_size = (int)voxel_params_dict["grid_y_size"];
@@ -62,7 +64,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> voxelization_forward(
     params.feature_num = feature_num;
     
     int max_voxel_num = params.grid_x_size * params.grid_y_size * params.grid_z_size;
-    int hash_table_size = max_voxel_num * 2; // 2x for better hash performance
+    int hash_table_size = std::min(max_voxel_num * 2, (int)(INT_MAX / 8)); // Limit to prevent overflow
     
     // Allocate GPU memory
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(points.device());
@@ -74,8 +76,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> voxelization_forward(
     auto voxel_idxs = torch::zeros({max_voxel_num}, torch::TensorOptions().dtype(torch::kInt32).device(points.device()));
     auto real_voxel_num_tensor = torch::zeros({1}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
     
-    // Initialize hash table with max values
-    hash_table.fill_(UINT64_MAX);
+    // Initialize hash table with max values - use a smaller value to avoid overflow
+    hash_table.fill_(-1);
     
     // Call CUDA kernel
     voxelizationLaunch(

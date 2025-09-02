@@ -71,9 +71,9 @@ def voxelize_points(points, voxel_params=None):
             'voxel_y_size': 0.075,
             'voxel_z_size': 0.2,
             'max_points_per_voxel': 10,
-            'grid_x_size': 1440,
-            'grid_y_size': 1440,
-            'grid_z_size': 40,
+            'grid_x_size': 100,  # Much smaller for testing
+            'grid_y_size': 100,  # Much smaller for testing
+            'grid_z_size': 10,
             'feature_num': 5
         }
     
