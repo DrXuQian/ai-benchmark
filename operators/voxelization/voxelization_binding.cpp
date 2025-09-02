@@ -70,8 +70,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> voxelization_forward(
     // Allocate GPU memory
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(points.device());
     auto hash_table = torch::empty({hash_table_size}, torch::TensorOptions().dtype(torch::kInt64).device(points.device()));
-    auto voxels_temp = torch::zeros({max_voxel_num, params.max_points_per_voxel, feature_num}, options);
-    auto voxel_point_mask = torch::zeros({max_voxel_num, params.max_points_per_voxel}, torch::TensorOptions().dtype(torch::kInt32).device(points.device()));
+    auto voxels_temp = torch::zeros({hash_table_size, params.max_points_per_voxel, feature_num}, options);
+    auto voxel_point_mask = torch::zeros({hash_table_size, params.max_points_per_voxel}, torch::TensorOptions().dtype(torch::kInt32).device(points.device()));
     auto voxel_features = torch::zeros({max_voxel_num, feature_num}, torch::TensorOptions().dtype(torch::kFloat16).device(points.device()));
     auto voxel_num_points = torch::zeros({hash_table_size}, torch::TensorOptions().dtype(torch::kInt64).device(points.device()));
     auto voxel_idxs = torch::zeros({max_voxel_num}, torch::TensorOptions().dtype(torch::kInt32).device(points.device()));

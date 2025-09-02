@@ -28,6 +28,11 @@ __device__ scalar_t multi_scale_kernel_attn_sampling(
     const scalar_t *&bottom_data, const int &height, const int &width,
     const int &nheads, const int &channels, const int &h,
     const int &w, const int &m, const int &c) {
+  // Add bounds checking to prevent illegal memory access
+  if (h < 0 || h >= height || w < 0 || w >= width || m < 0 || m >= nheads || c < 0 || c >= channels) {
+    return scalar_t(0.0);
+  }
+  
   const int w_stride = nheads * channels;
   const int h_stride = width * w_stride;
 
@@ -45,6 +50,12 @@ __device__ void multiscale_kernel_attn_sampling_backward(
     const int &nheads, const int &channels, const int &h,
     const int &w, const int &m, const int &c, const scalar_t &top_grad,
     const scalar_t &attn_weight, scalar_t *&grad_value,  scalar_t *grad_attn_weight) {
+
+  // Add bounds checking to prevent illegal memory access
+  if (h < 0 || h >= height || w < 0 || w >= width || m < 0 || m >= nheads || c < 0 || c >= channels) {
+    *grad_attn_weight = scalar_t(0.0);
+    return;
+  }
 
   const int w_stride = nheads * channels;
   const int h_stride = width * w_stride;
@@ -96,11 +107,22 @@ __global__ void multiscale_kernel_attn_forward_gpu_kernel(
           data_value +
           (data_value_ptr_init_offset + level_start_id * qid_stride);
       for (int p_col = 0; p_col < num_point; ++p_col) {
-        const int loc_w = (int)data_sampling_loc[data_loc_w_ptr];
-        const int loc_h = (int)data_sampling_loc[data_loc_w_ptr + 1];
+        const scalar_t loc_w_f = data_sampling_loc[data_loc_w_ptr];
+        const scalar_t loc_h_f = data_sampling_loc[data_loc_w_ptr + 1];
         const scalar_t weight = data_attn_weight[data_weight_ptr];
+        
+        // Add bounds checking to prevent illegal memory access
+        if (loc_w_f < -1.0f || loc_w_f >= spatial_w || loc_h_f < -1.0f || loc_h_f >= spatial_h) {
+          data_weight_ptr += 1;
+          data_loc_w_ptr += 2;
+          continue;
+        }
+        
+        const int loc_w = (int)loc_w_f;
+        const int loc_h = (int)loc_h_f;
         const int loc_h_ = clip(loc_h, 0, spatial_h-1);
         const int loc_w_ = clip(loc_w, 0, spatial_w-1);
+        
         col += multi_scale_kernel_attn_sampling(data_value_ptr, spatial_h, spatial_w, num_heads, 
                                                 channels, loc_h_, loc_w_, m_col, c_col) * weight;
 
@@ -168,10 +190,21 @@ __global__ void multiscale_kernel_attn_backward_gpu_kernel_shm_blocksize_aware_r
 
       for (int p_col=0; p_col < num_point; ++p_col)
       {
-        const int loc_w = (int)data_sampling_loc[data_loc_w_ptr];
-        const int loc_h = (int)data_sampling_loc[data_loc_w_ptr + 1];
+        const scalar_t loc_w_f = data_sampling_loc[data_loc_w_ptr];
+        const scalar_t loc_h_f = data_sampling_loc[data_loc_w_ptr + 1];
         const scalar_t weight = data_attn_weight[data_weight_ptr];
         *(cache_grad_attn_weight+threadIdx.x)=0;
+        
+        // Add bounds checking to prevent illegal memory access
+        if (loc_w_f < -1.0f || loc_w_f >= spatial_w || loc_h_f < -1.0f || loc_h_f >= spatial_h) {
+          data_weight_ptr += 1;
+          data_loc_w_ptr += 2;
+          grad_attn_weight += grad_weight_stride;
+          continue;
+        }
+        
+        const int loc_w = (int)loc_w_f;
+        const int loc_h = (int)loc_h_f;
         const int loc_h_ = clip(loc_h, 0, spatial_h-1);
         const int loc_w_ = clip(loc_w, 0, spatial_w-1);
         multiscale_kernel_attn_sampling_backward(
@@ -263,10 +296,21 @@ __global__ void multiscale_kernel_attn_backward_gpu_kernel_shm_reduce_v2(
 
       for (int p_col=0; p_col < num_point; ++p_col)
       {
-        const int loc_w = (int)data_sampling_loc[data_loc_w_ptr];
-        const int loc_h = (int)data_sampling_loc[data_loc_w_ptr + 1];
+        const scalar_t loc_w_f = data_sampling_loc[data_loc_w_ptr];
+        const scalar_t loc_h_f = data_sampling_loc[data_loc_w_ptr + 1];
         const scalar_t weight = data_attn_weight[data_weight_ptr];
         *(cache_grad_attn_weight+threadIdx.x)=0;
+        
+        // Add bounds checking to prevent illegal memory access
+        if (loc_w_f < -1.0f || loc_w_f >= spatial_w || loc_h_f < -1.0f || loc_h_f >= spatial_h) {
+          data_weight_ptr += 1;
+          data_loc_w_ptr += 2;
+          grad_attn_weight += grad_weight_stride;
+          continue;
+        }
+        
+        const int loc_w = (int)loc_w_f;
+        const int loc_h = (int)loc_h_f;
         const int loc_h_ = clip(loc_h, 0, spatial_h-1);
         const int loc_w_ = clip(loc_w, 0, spatial_w-1);
         multiscale_kernel_attn_sampling_backward(
