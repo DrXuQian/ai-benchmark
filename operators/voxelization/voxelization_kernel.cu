@@ -33,7 +33,7 @@ __global__ void buildHashKernel(
     float min_y_range, float max_y_range,
     float min_z_range, float max_z_range,
     float voxel_x_size, float voxel_y_size, float voxel_z_size,
-    int grid_y_size, int grid_x_size, int feature_num,
+    int grid_y_size, int grid_x_size, int grid_z_size, int feature_num,
     uint64_t* hash_table, int hash_table_size,
     unsigned int* real_voxel_num
 ) {
@@ -51,9 +51,9 @@ __global__ void buildHashKernel(
         return;
     }
 
-    int voxel_x = floor((px - min_x_range) / voxel_x_size);
-    int voxel_y = floor((py - min_y_range) / voxel_y_size);
-    int voxel_z = floor((pz - min_z_range) / voxel_z_size);
+    int voxel_x = min(max(0, (int)floor((px - min_x_range) / voxel_x_size)), grid_x_size - 1);
+    int voxel_y = min(max(0, (int)floor((py - min_y_range) / voxel_y_size)), grid_y_size - 1);
+    int voxel_z = min(max(0, (int)floor((pz - min_z_range) / voxel_z_size)), grid_z_size - 1);
 
     uint64_t voxel_offset = voxel_z * grid_y_size * grid_x_size + voxel_y * grid_x_size + voxel_x;
     uint64_t hash_key = hash_func(voxel_offset);
@@ -61,9 +61,9 @@ __global__ void buildHashKernel(
     for (uint64_t i = 0; i < hash_table_size; i++) {
         uint64_t hash_index = (hash_key + i) % hash_table_size;
         uint64_t old_voxel_id = atomicCAS((unsigned long long*)(hash_table + hash_index),
-                                          UINT64_MAX, voxel_offset);
+                                          (uint64_t)INT64_MAX, voxel_offset);
         
-        if (old_voxel_id == UINT64_MAX) {
+        if (old_voxel_id == (uint64_t)INT64_MAX) {
             atomicAdd(real_voxel_num, 1);
             break;
         } else if (old_voxel_id == voxel_offset) {
@@ -78,7 +78,7 @@ __global__ void voxelizationKernel(
     float min_y_range, float max_y_range,
     float min_z_range, float max_z_range,
     float voxel_x_size, float voxel_y_size, float voxel_z_size,
-    int grid_y_size, int grid_x_size, int feature_num,
+    int grid_y_size, int grid_x_size, int grid_z_size, int feature_num,
     int max_points_per_voxel, int max_voxel_num,
     uint64_t* hash_table, int hash_table_size,
     float* voxels_temp, int* voxel_point_mask,
@@ -99,9 +99,9 @@ __global__ void voxelizationKernel(
         return;
     }
 
-    int voxel_x = floor((px - min_x_range) / voxel_x_size);
-    int voxel_y = floor((py - min_y_range) / voxel_y_size);
-    int voxel_z = floor((pz - min_z_range) / voxel_z_size);
+    int voxel_x = min(max(0, (int)floor((px - min_x_range) / voxel_x_size)), grid_x_size - 1);
+    int voxel_y = min(max(0, (int)floor((py - min_y_range) / voxel_y_size)), grid_y_size - 1);
+    int voxel_z = min(max(0, (int)floor((pz - min_z_range) / voxel_z_size)), grid_z_size - 1);
 
     uint64_t voxel_offset = voxel_z * grid_y_size * grid_x_size + voxel_y * grid_x_size + voxel_x;
     uint64_t hash_key = hash_func(voxel_offset);
@@ -182,7 +182,7 @@ void voxelizationLaunch(
         params.min_y_range, params.max_y_range,
         params.min_z_range, params.max_z_range,
         params.voxel_x_size, params.voxel_y_size, params.voxel_z_size,
-        params.grid_y_size, params.grid_x_size, params.feature_num,
+        params.grid_y_size, params.grid_x_size, params.grid_z_size, params.feature_num,
         hash_table, hash_table_size, d_real_voxel_num
     );
 
@@ -194,7 +194,7 @@ void voxelizationLaunch(
         params.min_y_range, params.max_y_range,
         params.min_z_range, params.max_z_range,
         params.voxel_x_size, params.voxel_y_size, params.voxel_z_size,
-        params.grid_y_size, params.grid_x_size, params.feature_num,
+        params.grid_y_size, params.grid_x_size, params.grid_z_size, params.feature_num,
         params.max_points_per_voxel, max_voxel_num,
         hash_table, hash_table_size, voxels_temp,
         voxel_point_mask, real_voxel_num, voxel_num_points, voxel_idxs

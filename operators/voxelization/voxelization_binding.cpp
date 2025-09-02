@@ -5,6 +5,7 @@
 #include <iostream>
 #include <algorithm>
 #include <climits>
+#include <cstdint>
 
 // Forward declarations
 struct VoxelParams {
@@ -76,8 +77,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> voxelization_forward(
     auto voxel_idxs = torch::zeros({max_voxel_num}, torch::TensorOptions().dtype(torch::kInt32).device(points.device()));
     auto real_voxel_num_tensor = torch::zeros({1}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
     
-    // Initialize hash table with max values - use a smaller value to avoid overflow
-    hash_table.fill_(-1);
+    // Initialize hash table with max safe signed int64 value
+    hash_table.fill_(INT64_MAX);
     
     // Call CUDA kernel
     voxelizationLaunch(

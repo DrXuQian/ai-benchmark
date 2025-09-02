@@ -64,7 +64,7 @@ __device__ void multiscale_kernel_attn_sampling_backward(
 template <typename scalar_t>
 __global__ void multiscale_kernel_attn_forward_gpu_kernel(
     const int n, const scalar_t *data_value, const int64_t *data_spatial_shapes,
-    const int64_t *data_level_start_index, const int64_t *data_sampling_loc,
+    const int64_t *data_level_start_index, const scalar_t *data_sampling_loc,
     const scalar_t *data_attn_weight, const int batch_size,
     const int spatial_size, const int num_heads, const int channels,
     const int num_levels, const int num_query, const int num_point,
@@ -96,8 +96,8 @@ __global__ void multiscale_kernel_attn_forward_gpu_kernel(
           data_value +
           (data_value_ptr_init_offset + level_start_id * qid_stride);
       for (int p_col = 0; p_col < num_point; ++p_col) {
-        const int loc_w = data_sampling_loc[data_loc_w_ptr];
-        const int loc_h = data_sampling_loc[data_loc_w_ptr + 1];
+        const int loc_w = (int)data_sampling_loc[data_loc_w_ptr];
+        const int loc_h = (int)data_sampling_loc[data_loc_w_ptr + 1];
         const scalar_t weight = data_attn_weight[data_weight_ptr];
         const int loc_h_ = clip(loc_h, 0, spatial_h-1);
         const int loc_w_ = clip(loc_w, 0, spatial_w-1);
@@ -118,7 +118,7 @@ __global__ void multiscale_kernel_attn_backward_gpu_kernel_shm_blocksize_aware_r
                                                 const scalar_t *data_value,
                                                 const int64_t *data_spatial_shapes,
                                                 const int64_t *data_level_start_index, 
-                                                const int64_t *data_sampling_loc,
+                                                const scalar_t *data_sampling_loc,
                                                 const scalar_t *data_attn_weight,
                                                 const int batch_size, 
                                                 const int spatial_size, 
@@ -168,8 +168,8 @@ __global__ void multiscale_kernel_attn_backward_gpu_kernel_shm_blocksize_aware_r
 
       for (int p_col=0; p_col < num_point; ++p_col)
       {
-        const int loc_w = data_sampling_loc[data_loc_w_ptr];
-        const int loc_h = data_sampling_loc[data_loc_w_ptr + 1];
+        const int loc_w = (int)data_sampling_loc[data_loc_w_ptr];
+        const int loc_h = (int)data_sampling_loc[data_loc_w_ptr + 1];
         const scalar_t weight = data_attn_weight[data_weight_ptr];
         *(cache_grad_attn_weight+threadIdx.x)=0;
         const int loc_h_ = clip(loc_h, 0, spatial_h-1);
@@ -211,7 +211,7 @@ __global__ void multiscale_kernel_attn_backward_gpu_kernel_shm_reduce_v2(
   const scalar_t *data_value,
   const int64_t *data_spatial_shapes,
   const int64_t *data_level_start_index, 
-  const int64_t *data_sampling_loc,
+  const scalar_t *data_sampling_loc,
   const scalar_t *data_attn_weight,
   const int batch_size, 
   const int spatial_size, 
@@ -263,8 +263,8 @@ __global__ void multiscale_kernel_attn_backward_gpu_kernel_shm_reduce_v2(
 
       for (int p_col=0; p_col < num_point; ++p_col)
       {
-        const int loc_w = data_sampling_loc[data_loc_w_ptr];
-        const int loc_h = data_sampling_loc[data_loc_w_ptr + 1];
+        const int loc_w = (int)data_sampling_loc[data_loc_w_ptr];
+        const int loc_h = (int)data_sampling_loc[data_loc_w_ptr + 1];
         const scalar_t weight = data_attn_weight[data_weight_ptr];
         *(cache_grad_attn_weight+threadIdx.x)=0;
         const int loc_h_ = clip(loc_h, 0, spatial_h-1);
@@ -309,7 +309,7 @@ void multiscale_kernel_attn_forward_cuda(cudaStream_t stream,
                               const scalar_t* data_value,
                               const int64_t* data_spatial_shapes, 
                               const int64_t* data_level_start_index, 
-                              const int64_t* data_sampling_loc,
+                              const scalar_t* data_sampling_loc,
                               const scalar_t* data_attn_weight,
                               const int batch_size,
                               const int spatial_size, 
@@ -344,7 +344,7 @@ void multiscale_kernel_attn_backward_cuda(cudaStream_t stream,
                                           const scalar_t* data_value,
                                           const int64_t * data_spatial_shapes,
                                           const int64_t * data_level_start_index,
-                                          const int64_t * data_sampling_loc,
+                                          const scalar_t * data_sampling_loc,
                                           const scalar_t * data_attn_weight,
                                           const int batch_size, 
                                           const int spatial_size, 

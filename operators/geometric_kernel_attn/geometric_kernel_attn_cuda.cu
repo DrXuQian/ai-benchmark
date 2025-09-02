@@ -93,7 +93,7 @@ std::vector<at::Tensor> geometric_kernel_attn_cuda_backward(
     AT_ASSERTM(level_start_index.is_cuda(), "level_start_index must be a CUDA tensor");
     AT_ASSERTM(sampling_loc.is_cuda(), "sampling_loc must be a CUDA tensor");
     AT_ASSERTM(attn_weight.is_cuda(), "attn_weight must be a CUDA tensor");
-    AT_ASSERTM(grad_output.type().is_cuda(), "grad_output must be a CUDA tensor");
+    AT_ASSERTM(grad_output.is_cuda(), "grad_output must be a CUDA tensor");
 
 
     const int batch = value.size(0);
@@ -122,7 +122,7 @@ std::vector<at::Tensor> geometric_kernel_attn_cuda_backward(
     for (int n = 0; n < batch/im2col_step_; ++n)
     {
         auto grad_output_g = grad_output_n.select(0, n);
-        AT_DISPATCH_FLOATING_TYPES(value.type(), "multiscale_kernel_attn_backward_cuda", ([&] {
+        AT_DISPATCH_FLOATING_TYPES(value.scalar_type(), "multiscale_kernel_attn_backward_cuda", ([&] {
           multiscale_kernel_attn_backward_cuda(at::cuda::getCurrentCUDAStream(),
                                     grad_output_g.data<scalar_t>(),
                                     value.data<scalar_t>() + n * im2col_step_ * per_value_size,
