@@ -6,33 +6,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstdint>
-
-// Forward declarations
-struct VoxelParams {
-    float min_x_range = -54.0f;
-    float max_x_range = 54.0f;
-    float min_y_range = -54.0f;
-    float max_y_range = 54.0f;
-    float min_z_range = -5.0f;
-    float max_z_range = 3.0f;
-    float voxel_x_size = 0.075f;
-    float voxel_y_size = 0.075f;
-    float voxel_z_size = 0.2f;
-    int max_points_per_voxel = 10;
-    int grid_x_size = 1440;
-    int grid_y_size = 1440;
-    int grid_z_size = 40;
-    int feature_num = 5;
-};
-
-extern "C" void voxelizationLaunch(
-    float* points, int points_size,
-    VoxelParams& params,
-    uint64_t* hash_table, int hash_table_size,
-    float* voxels_temp, int* voxel_point_mask,
-    __half* voxel_features, int* real_voxel_num,
-    uint64_t* voxel_num_points, int* voxel_idxs
-);
+#include "voxelization_kernel.h"
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> voxelization_forward(
     torch::Tensor points,
@@ -43,10 +17,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> voxelization_forward(
     TORCH_CHECK(points.dtype() == torch::kFloat32, "Points must be float32");
     TORCH_CHECK(points.dim() == 2, "Points must be 2D tensor");
     TORCH_CHECK(points.size(1) >= 5, "Points must have at least 5 features");
-    
+
     int points_size = points.size(0);
     int feature_num = points.size(1);
-    
+
     // Setup voxel parameters
     VoxelParams params;
     params.min_x_range = (float)voxel_params_dict["min_x_range"];
@@ -59,60 +33,77 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> voxelization_forward(
     params.voxel_y_size = (float)voxel_params_dict["voxel_y_size"];
     params.voxel_z_size = (float)voxel_params_dict["voxel_z_size"];
     params.max_points_per_voxel = (int)voxel_params_dict["max_points_per_voxel"];
-    params.grid_x_size = (int)voxel_params_dict["grid_x_size"];
-    params.grid_y_size = (int)voxel_params_dict["grid_y_size"];
-    params.grid_z_size = (int)voxel_params_dict["grid_z_size"];
+    params.grid_x_size = params.getGridXSize();
+    params.grid_y_size = params.getGridYSize();
+    params.grid_z_size = params.getGridZSize();
     params.feature_num = feature_num;
-    
-    int max_voxel_num = params.grid_x_size * params.grid_y_size * params.grid_z_size;
-    int hash_table_size = std::min(max_voxel_num * 2, (int)(INT_MAX / 8)); // Limit to prevent overflow
-    
+    params.max_voxels = (int)voxel_params_dict.count("max_voxels") ?
+                        (int)voxel_params_dict["max_voxels"] : params.max_voxels;
+
+    // Calculate hash table size (similar to NVIDIA implementation)
+    int hash_table_size = points_size * 2 * 2;
+
     // Allocate GPU memory
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(points.device());
-    auto hash_table = torch::empty({hash_table_size}, torch::TensorOptions().dtype(torch::kInt64).device(points.device()));
-    auto voxels_temp = torch::zeros({hash_table_size, params.max_points_per_voxel, feature_num}, options);
-    auto voxel_point_mask = torch::zeros({hash_table_size, params.max_points_per_voxel}, torch::TensorOptions().dtype(torch::kInt32).device(points.device()));
-    auto voxel_features = torch::zeros({max_voxel_num, feature_num}, torch::TensorOptions().dtype(torch::kFloat16).device(points.device()));
-    auto voxel_num_points = torch::zeros({hash_table_size}, torch::TensorOptions().dtype(torch::kInt64).device(points.device()));
-    auto voxel_idxs = torch::zeros({max_voxel_num}, torch::TensorOptions().dtype(torch::kInt32).device(points.device()));
-    auto real_voxel_num_tensor = torch::zeros({1}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU));
-    
-    // Initialize hash table with max safe signed int64 value
-    hash_table.fill_(INT64_MAX);
-    
-    // Call CUDA kernel
-    voxelizationLaunch(
+    auto hash_table = torch::empty({hash_table_size}, torch::TensorOptions().dtype(torch::kInt32).device(points.device()));
+    auto voxels_temp = torch::zeros({params.max_voxels, params.max_points_per_voxel, feature_num}, options);
+    auto voxel_features = torch::zeros({params.max_voxels, feature_num}, torch::TensorOptions().dtype(torch::kFloat16).device(points.device()));
+    auto num_points_per_voxel = torch::zeros({params.max_voxels}, torch::TensorOptions().dtype(torch::kInt32).device(points.device()));
+    auto voxel_indices = torch::zeros({params.max_voxels, 4}, torch::TensorOptions().dtype(torch::kInt32).device(points.device()));
+    auto real_voxel_num = torch::zeros({1}, torch::TensorOptions().dtype(torch::kInt32).device(points.device()));
+
+    // Initialize hash table with UINT32_MAX (empty key)
+    hash_table.fill_(UINT32_MAX);
+
+    // Get CUDA stream
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    // Call CUDA kernel using NVIDIA implementation
+    cudaError_t err = voxelizationLaunch(
         points.data_ptr<float>(),
         points_size,
-        params,
-        (uint64_t*)hash_table.data_ptr<int64_t>(),
-        hash_table_size,
+        params.min_x_range, params.max_x_range,
+        params.min_y_range, params.max_y_range,
+        params.min_z_range, params.max_z_range,
+        params.voxel_x_size, params.voxel_y_size, params.voxel_z_size,
+        params.grid_y_size, params.grid_x_size, feature_num, params.max_voxels,
+        params.max_points_per_voxel,
+        (unsigned int*)hash_table.data_ptr<int>(),
+        (unsigned int*)num_points_per_voxel.data_ptr<int>(),
         voxels_temp.data_ptr<float>(),
-        voxel_point_mask.data_ptr<int>(),
-        (__half*)voxel_features.data_ptr<at::Half>(),
-        real_voxel_num_tensor.data_ptr<int>(),
-        (uint64_t*)voxel_num_points.data_ptr<int64_t>(),
-        voxel_idxs.data_ptr<int>()
+        (unsigned int*)voxel_indices.data_ptr<int>(),
+        (unsigned int*)real_voxel_num.data_ptr<int>(),
+        stream
     );
-    
-    // Generate voxel coordinates
-    auto voxel_coords = torch::zeros({max_voxel_num, 3}, torch::TensorOptions().dtype(torch::kInt32).device(points.device()));
-    
-    // Simple coordinate generation (this could be optimized with CUDA kernel)
-    auto voxel_coords_cpu = voxel_coords.cpu();
-    for (int i = 0; i < max_voxel_num; i++) {
-        int z = i / (params.grid_y_size * params.grid_x_size);
-        int y = (i % (params.grid_y_size * params.grid_x_size)) / params.grid_x_size;
-        int x = i % params.grid_x_size;
-        voxel_coords_cpu[i][0] = x;
-        voxel_coords_cpu[i][1] = y;
-        voxel_coords_cpu[i][2] = z;
+
+    if (err != cudaSuccess) {
+        TORCH_CHECK(false, "CUDA error in voxelizationLaunch: ", cudaGetErrorString(err));
     }
-    voxel_coords.copy_(voxel_coords_cpu);
-    
-    // Convert voxel_num_points to appropriate format
-    auto num_points_per_voxel = torch::zeros({max_voxel_num}, torch::TensorOptions().dtype(torch::kInt32).device(points.device()));
-    
+
+    // Feature extraction
+    cudaMemcpyAsync(&params.max_voxels, real_voxel_num.data_ptr<int>(),
+                    sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+
+    err = featureExtractionLaunch(
+        voxels_temp.data_ptr<float>(),
+        (unsigned int*)num_points_per_voxel.data_ptr<int>(),
+        params.max_voxels,
+        params.max_points_per_voxel,
+        feature_num,
+        (half*)voxel_features.data_ptr<at::Half>(),
+        stream
+    );
+
+    if (err != cudaSuccess) {
+        TORCH_CHECK(false, "CUDA error in featureExtractionLaunch: ", cudaGetErrorString(err));
+    }
+
+    cudaStreamSynchronize(stream);
+
+    // Extract voxel coordinates from voxel_indices (batch, z, y, x format)
+    auto voxel_coords = voxel_indices.index({torch::indexing::Slice(), torch::indexing::Slice(1, 4)});
+
     return std::make_tuple(
         voxel_features.to(torch::kFloat32),  // Convert back to float32 for compatibility
         voxel_coords,
@@ -121,5 +112,5 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> voxelization_forward(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &voxelization_forward, "Voxelization forward");
+    m.def("forward", &voxelization_forward, "Voxelization forward (NVIDIA implementation)");
 }
