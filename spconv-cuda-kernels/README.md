@@ -2,6 +2,8 @@
 
 This repository contains the **complete standalone C++ implementation** of the SPConv (Spatially Sparse Convolution) CUDA kernels, extracted from the original [spconv](https://github.com/traveller59/spconv) library. These are the **exact same production CUDA kernels** used in PyTorch spconv, but without Python dependencies.
 
+> **Note**: The standalone C++ build requires additional tensorview dependencies. For immediate use, the PyTorch interface is recommended. See [BUILD_STATUS.md](BUILD_STATUS.md) for details.
+
 ## Features
 
 - **Complete SPConv Infrastructure**: All 22,320+ files (194MB) of production CUDA kernels

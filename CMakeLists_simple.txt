@@ -1,0 +1,33 @@
+cmake_minimum_required(VERSION 3.16)
+project(test_libspconv CUDA CXX)
+
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CUDA_STANDARD 14)
+
+find_package(CUDAToolkit REQUIRED)
+
+# Include directories
+include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/spconv_standalone/include
+    /tmp  # For json.hpp
+)
+
+# Simple test first - just check if headers work
+add_executable(test_simple test_simple_libspconv.cpp)
+
+target_link_libraries(test_simple
+    CUDA::cudart
+)
+
+# Check that the includes are found
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/spconv_standalone/include/spconvlib/cumm/common/TensorView.h")
+    message(STATUS "✓ Found TensorView.h")
+else()
+    message(ERROR "✗ TensorView.h not found!")
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/spconv_standalone/include/spconvlib/spconv/csrc/sparse/all/SpconvOps.h")
+    message(STATUS "✓ Found SpconvOps.h")
+else()
+    message(ERROR "✗ SpconvOps.h not found!")
+endif()
