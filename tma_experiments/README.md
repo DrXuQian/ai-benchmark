@@ -11,6 +11,11 @@ This repository contains experiments for implementing deformable attention using
   - Achieves ~311 GB/s bandwidth on RTX 5070 (SM 12.0)
   - Uses cooperative loading with proper shared memory alignment
 
+- **test_tma_descriptor.cu** - TMA descriptor API test
+  - Verifies `cuTensorMapEncodeTiled` works correctly
+  - Tests actual TMA PTX instruction: `cp.async.bulk.tensor.3d`
+  - **MUST run on Hopper (SM 9.0)** - fails on SM 12.0
+
 ### Deformable Attention Kernels
 
 - **deform_attn.cu** - Original deformable attention implementation
@@ -21,18 +26,46 @@ This repository contains experiments for implementing deformable attention using
   - Loads entire 2x2x32 tiles into shared memory cooperatively
   - Reuses shared memory across levels (sequential processing)
   - Parameters: 8 points, 4 levels, 32 channels, 8 output channels per thread
+  - Works on all architectures (no TMA required)
+
+- **deform_attn_tma.cu** - Real TMA implementation
+  - Uses `cp.async.bulk.tensor.3d.shared::cluster.global` PTX instruction
+  - Requires TMA descriptors created with `cuTensorMapEncodeTiled`
+  - Includes `createTMADescriptorsForAllBatches()` host function
+  - **MUST run on Hopper (SM 9.0)** - TMA descriptor API fails on SM 12.0
 
 ## Build Instructions
 
-### Microbenchmark
+### Quick Start (on Hopper)
 ```bash
-nvcc -arch=sm_90 -O3 tma_2x2x32_final.cu -o tma_2x2x32_final
-./tma_2x2x32_final
+make all
+make test
 ```
 
-### Deformable Attention
+### Individual Targets
+
+#### Tile Loading Microbenchmark
 ```bash
-nvcc -arch=sm_90 -O3 -c deform_attn_2x2x32_optimized.cu -o deform_attn_2x2x32_optimized.o
+nvcc -arch=sm_90 -O3 tma_2x2x32_final.cu -o tma_microbench
+./tma_microbench
+```
+
+#### TMA Descriptor Test (MUST run on Hopper)
+```bash
+nvcc -arch=sm_90 -O3 -std=c++17 -lcuda test_tma_descriptor.cu -o test_tma_descriptor
+./test_tma_descriptor
+```
+
+#### Deformable Attention Kernels
+```bash
+# Optimized version (works on all architectures)
+nvcc -arch=sm_90 -O3 -c deform_attn_2x2x32_optimized.cu -o deform_attn_optimized.o
+
+# TMA version (requires Hopper)
+nvcc -arch=sm_90 -O3 -std=c++17 -lcuda -c deform_attn_tma.cu -o deform_attn_tma.o
+
+# Baseline
+nvcc -arch=sm_90 -O3 -c deform_attn.cu -o deform_attn_baseline.o
 ```
 
 ## Current Status
@@ -51,6 +84,12 @@ nvcc -arch=sm_90 -O3 -c deform_attn_2x2x32_optimized.cu -o deform_attn_2x2x32_op
 The TMA descriptor API should work properly on Hopper architecture. The experiments need to be validated on:
 - H100 (SM 9.0)
 - H200 (SM 9.0)
+
+**Run this first on Hopper:**
+```bash
+./test_tma_descriptor
+```
+This will verify that TMA descriptor creation works. If this passes, then `deform_attn_tma.cu` should work.
 
 ## TMA Implementation Strategy
 
