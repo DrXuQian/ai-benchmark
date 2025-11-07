@@ -1,10 +1,25 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cudaTypedefs.h>  // PFN_cuTensorMapEncodeTiled
 #include <cstdio>
 #include <vector>
 
 using TmaDescriptor = CUtensorMap;
+
+// Get cuTensorMapEncodeTiled function pointer dynamically
+PFN_cuTensorMapEncodeTiled get_cuTensorMapEncodeTiled() {
+    cudaDriverEntryPointQueryResult driver_status;
+    void* func_ptr = nullptr;
+    cudaError_t err = cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &func_ptr,
+                                               cudaEnableDefault, &driver_status);
+    if (err != cudaSuccess) {
+        printf("Failed to get cuTensorMapEncodeTiled entry point: %s\n",
+               cudaGetErrorString(err));
+        return nullptr;
+    }
+    return reinterpret_cast<PFN_cuTensorMapEncodeTiled>(func_ptr);
+}
 
 // Simple test kernel using TMA
 __device__ __forceinline__ uint32_t __as_ptr_smem(const void* ptr) {
@@ -99,14 +114,27 @@ int main() {
     TmaDescriptor h_tma_desc;
 
     cuuint64_t globalDim[3] = {(cuuint64_t)H, (cuuint64_t)W, (cuuint64_t)C};
+
+    // IMPORTANT: stride array has rank-1 elements (not rank!)
+    // stride[0] = bytes between consecutive elements in dim[0]
+    // stride[1] = bytes between consecutive elements in dim[1]
+    // stride for last dimension is implicit (sizeof element)
     cuuint64_t globalStrides[2] = {
-        W * C * sizeof(__half),  // H stride
-        C * sizeof(__half)        // W stride
+        W * C * sizeof(__half),  // stride for dimension 0 (H): skip one row
+        C * sizeof(__half)        // stride for dimension 1 (W): skip one column
     };
+
     cuuint32_t boxDim[3] = {2, 2, 32};
     cuuint32_t elementStrides[3] = {1, 1, 1};
 
-    CUresult result = cuTensorMapEncodeTiled(
+    // Get function pointer dynamically (required for SM 12.0!)
+    auto cuTensorMapEncodeTiled_func = get_cuTensorMapEncodeTiled();
+    if (!cuTensorMapEncodeTiled_func) {
+        printf("❌ Failed to get cuTensorMapEncodeTiled function pointer\n");
+        return 1;
+    }
+
+    CUresult result = cuTensorMapEncodeTiled_func(
         &h_tma_desc,
         CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
         3,

@@ -1,13 +1,27 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cudaTypedefs.h>  // PFN_cuTensorMapEncodeTiled
 #include <cstdio>
 #include <cstdlib>
 
 // 真正的TMA实现 - 使用cp.async.bulk.tensor.3d PTX指令
-// 需要在Hopper (SM 9.0)上测试
+// 使用动态entry point获取cuTensorMapEncodeTiled (required for SM 12.0)
 
 using TmaDescriptor = CUtensorMap;
+
+// Get cuTensorMapEncodeTiled function pointer dynamically
+inline PFN_cuTensorMapEncodeTiled get_cuTensorMapEncodeTiled() {
+    cudaDriverEntryPointQueryResult driver_status;
+    void* func_ptr = nullptr;
+    cudaError_t err = cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &func_ptr,
+                                               cudaEnableDefault, &driver_status);
+    if (err != cudaSuccess) {
+        printf("Failed to get cuTensorMapEncodeTiled: %s\n", cudaGetErrorString(err));
+        return nullptr;
+    }
+    return reinterpret_cast<PFN_cuTensorMapEncodeTiled>(func_ptr);
+}
 
 // Helper function to convert pointer to shared memory address
 __device__ __forceinline__ uint32_t __as_ptr_smem(const void* ptr) {
@@ -213,23 +227,33 @@ CUresult createTMADescriptorsForAllBatches(
                 (cuuint64_t)channels
             };
 
-            // Strides in bytes (skip first dimension)
+            // Strides in bytes - array has (rank-1) elements!
+            // For rank=3 tensor, need 2 strides
+            // stride[0] = bytes to skip to go from element[i][j][k] to element[i+1][j][k]
+            // stride[1] = bytes to skip to go from element[i][j][k] to element[i][j+1][k]
+            // stride for last dim (C) is implicit = sizeof(element)
             cuuint64_t globalStrides[2] = {
-                spatial_w * channels * sizeof(__half),  // H stride
-                channels * sizeof(__half)                // W stride
-                // C stride is implicit (sizeof element)
+                spatial_w * channels * sizeof(__half),  // dim[0] stride (H)
+                channels * sizeof(__half)                // dim[1] stride (W)
             };
 
             // Box/tile dimensions: 2x2x32
             cuuint32_t boxDim[3] = {2, 2, 32};
 
-            // Element strides: contiguous
+            // Element strides: contiguous access pattern
             cuuint32_t elementStrides[3] = {1, 1, 1};
 
             // Offset pointer for this level
             const void* level_ptr = (const __half*)d_value_ptrs[batch_idx] + level_start * channels;
 
-            CUresult result = cuTensorMapEncodeTiled(
+            // Get function pointer dynamically
+            static auto cuTensorMapEncodeTiled_func = get_cuTensorMapEncodeTiled();
+            if (!cuTensorMapEncodeTiled_func) {
+                printf("ERROR: Failed to get cuTensorMapEncodeTiled function pointer\n");
+                return CUDA_ERROR_NOT_SUPPORTED;
+            }
+
+            CUresult result = cuTensorMapEncodeTiled_func(
                 &h_descriptors[descriptor_idx],
                 CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
                 3,  // rank
