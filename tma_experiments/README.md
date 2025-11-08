@@ -8,7 +8,8 @@ This directory contains experiments and implementations for using NVIDIA Hopper'
 - Verified correct TMA dimension mapping: X→C, Y→W, Z→H for [H][W][C] layout
 - Achieved 95.6% accuracy on real test data
 - Identified root cause of 4.4% discrepancy: FP16 precision in coordinate calculation
-- **Benchmarked: TMA is 1.33x faster than manual loading (150 vs 109 GB/s)**
+- **Optimized with per-warp barriers: 1.58x faster than manual loading**
+- **Per-warp barriers are 24% faster than block-level barriers**
 
 ## Key Files
 
@@ -17,16 +18,23 @@ This directory contains experiments and implementations for using NVIDIA Hopper'
   - Single thread (tid==0) issues TMA load
   - Verified with real deformable attention data
   - Serves as correctness reference
-- **`tma_concurrent_8loads.cu`**: Production multi-TMA concurrent loading (95.6% accuracy)
+- **`tma_concurrent_8loads.cu`**: Multi-TMA with block-level barriers (95.6% accuracy)
   - 8 concurrent TMA loads (threadIdx%4==0 pattern)
-  - Matches deformable attention's bilinear sampling pattern
+  - Block-level barrier synchronization
   - 4.4% discrepancy due to FP16 precision (expected behavior)
+- **`tma_concurrent_warp_barrier.cu`**: ⭐ **RECOMMENDED** Multi-TMA with per-warp barriers
+  - 8 warps → 8 points (1:1 mapping)
+  - Per-warp independent synchronization
+  - **24% faster than block-level barriers**
+  - Best performance for deformable attention
 - **`deform_attn_tma_match_original.cu`**: Full deformable attention with TMA
 
 ### Benchmarks
 - **`benchmark_tma_loading.cu`**: Performance benchmark for TMA loading
 - **`benchmark_comparison.cu`**: TMA vs manual loading comparison
+- **`benchmark_all_methods.cu`**: Comprehensive comparison of all three methods
 - **`BENCHMARK_RESULTS.md`**: Detailed performance analysis and results
+- **`WARP_BARRIER_ANALYSIS.md`**: Per-warp barrier optimization analysis
 
 ### Documentation
 - **`TMA_DIMENSION_MAPPING.md`**: Critical documentation of TMA dimension ordering and memory layout
@@ -84,24 +92,27 @@ boxDim = {32, 2, 2};  // {C, W, H} - Load 2x2 spatial tile, 32 channels
 
 ### Benchmark Summary (RTX 5070 - Blackwell sm_90)
 
-**TMA vs Manual Loading (1000 queries × 8 points)**
-- TMA: 13.1 μs, 150.78 GB/s
-- Manual: 17.5 μs, 109.29 GB/s
-- **Speedup: 1.33x faster with TMA**
+**Comprehensive Comparison (1000 queries × 8 points)**
 
-**TMA Metrics**
-- Kernel time: 12.6 μs (average)
-- TMA operations: 632 Million ops/s
-- Time per TMA load: 1.58 ns
-- Memory efficiency: 22.4% (limited by random access pattern)
+| Method | Time (μs) | Bandwidth (GB/s) | Speedup |
+|--------|-----------|------------------|---------|
+| Manual (baseline) | 16.6 | 115.20 | 1.00x |
+| TMA Block-Barrier | 13.0 | 146.30 | 1.27x |
+| **TMA Warp-Barrier** | **10.5** | **182.11** | **1.58x** |
 
-**Key Benefits**
-- Hardware-managed asynchronous transfers
-- Reduced instruction overhead
-- Better memory access optimization
-- Cleaner, more maintainable code
+**Key Results:**
+- ⭐ **Warp-barrier is 58% faster than manual loading**
+- ⭐ **Warp-barrier is 24% faster than block-barrier**
+- Effective bandwidth: 182 GB/s (27% of peak)
+- TMA operations: 728 Million ops/s
 
-See `BENCHMARK_RESULTS.md` for detailed analysis.
+**Why Per-Warp Barriers Win:**
+- Finer-grained synchronization (8 barriers of 32 threads vs 1 barrier of 256 threads)
+- Independent warp execution (no cross-warp blocking)
+- Natural 8 warps → 8 points mapping
+- Reduced synchronization overhead
+
+See `WARP_BARRIER_ANALYSIS.md` and `BENCHMARK_RESULTS.md` for detailed analysis.
 
 ## Next Steps
 
