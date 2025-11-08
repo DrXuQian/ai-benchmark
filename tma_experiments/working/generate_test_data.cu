@@ -41,11 +41,35 @@ int main() {
     std::mt19937 gen(42);  // Fixed seed for reproducibility
     std::uniform_real_distribution<float> dis(0.0f, 1.0f);
 
-    // 1. Value: [batch][spatial_size][channels]
-    printf("Generating value data...\n");
-    std::vector<__half> value(batch * spatial_size * channels);
-    for (size_t i = 0; i < value.size(); i++) {
-        value[i] = __float2half(dis(gen) * 2.0f - 1.0f);  // [-1, 1]
+    // 1. Value: [batch][spatial_size][channels] with padding
+    // Each level is stored as (H+2) × (W+2) × C with padding zeros
+    printf("Generating value data with padding...\n");
+    std::vector<__half> value(batch * spatial_size * channels, __float2half(0.0f));
+
+    // Spatial shapes: [H, W] for each level
+    int H[4] = {92, 46, 23, 12};
+    int W[4] = {160, 80, 40, 20};
+
+    for (int b = 0; b < batch; b++) {
+        int offset = 0;  // Offset in spatial_size units
+
+        for (int l = 0; l < num_levels; l++) {
+            int h_padded = H[l] + 2;
+            int w_padded = W[l] + 2;
+
+            // Fill only the valid region (excluding padding)
+            for (int h = 1; h <= H[l]; h++) {  // h=1 to H[l] (skip h=0 and h=H[l]+1)
+                for (int w = 1; w <= W[l]; w++) {  // w=1 to W[l] (skip w=0 and w=W[l]+1)
+                    for (int c = 0; c < channels; c++) {
+                        int spatial_idx = h * w_padded + w;  // Position in padded layout
+                        int idx = ((b * spatial_size + offset + spatial_idx) * channels) + c;
+                        value[idx] = __float2half(dis(gen) * 2.0f - 1.0f);  // [-1, 1]
+                    }
+                }
+            }
+
+            offset += h_padded * w_padded;  // Move to next level
+        }
     }
     save_binary("test_data_value.bin", value.data(), value.size() * sizeof(__half));
 
