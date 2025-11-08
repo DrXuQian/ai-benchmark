@@ -7,6 +7,9 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda.h>
+#include <cudaTypedefs.h>
+#include <cuda/barrier>
+#include <cooperative_groups.h>
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -71,13 +74,14 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
 
     const half2 zp5 = half2(0.5f, 0.5f);
 
+    const int tid = threadIdx.x;
     const int lane_id = tid % 32;
     const int warp_id = tid / 32;
     const int query_id_in_warp = lane_id >> 2;
     const int is_loader_thread = lane_id % 4 == 0;
-    const int n_warp = gridDimx.x;
+    const int n_warp = blockDim.x / 32;
     const int query_in_warp = 32 / (CHANNELS / NUM_OUTPUT);
-    __shared__ alignas(128) scalar_t smem_tile[STAGES][n_warp][query_in_warp][2][2][32];
+    __shared__ alignas(128) scalar_t smem_tile[STAGES][16][8][2][2][32];  // max 512 threads = 16 warps, 8 queries per warp
 
     // Per-warp barriers
     #pragma nv_diag_suppress static_var_with_dynamic_init
@@ -94,7 +98,7 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
         #pragma unroll
         for (int l = 0; l < NUM_LEVELS; l++) {
             const int desc_idx = b_col * NUM_LEVELS + l;
-            const CUtensorMap* desc_ptr = &tma_descs_all[desc_idx];
+            const CUtensorMap* desc_ptr = &d_tma_descs[desc_idx];
             // prefetch.tensormap brings descriptor to L2 cache
             asm volatile(
                 "prefetch.tensormap [%0];\n\t"
@@ -159,7 +163,7 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
             // Select correct TMA descriptor for this batch and level
             // Index: batch * NUM_LEVELS + level
             const int desc_idx = b_col * NUM_LEVELS + l_col;
-            const CUtensorMap* tma_desc = &tma_descs_all[desc_idx];
+            const CUtensorMap* tma_desc = &d_tma_descs[desc_idx];
 
             // Issue TMA load for this level
             asm volatile(
@@ -415,7 +419,7 @@ int main(int argc, char* argv[]) {
     // Total: 48 batches × 4 levels = 192 separate buffers
     CUtensorMap h_tma_descs[batch][num_levels];  // Host-side array
     auto cuTensorMapEncodeTiled_func = get_cuTensorMapEncodeTiled();
-    single_batch_total_size = spatial_size * channels;
+    size_t single_batch_total_size = spatial_size * channels;
     for (int b = 0; b < batch; b++) {
         for (int l = 0; l < num_levels; l++) {
             size_t batch_offset = b * single_batch_total_size;
@@ -424,10 +428,10 @@ int main(int argc, char* argv[]) {
             int w = d_spatial_shapes[l * 2 + 1];
 
             // Create TMA descriptor for this batch×level combination
-            uint64_t globalDim[3] = {channels, w + 2, h + 2};
+            uint64_t globalDim[3] = {(uint64_t)channels, (uint64_t)(w + 2), (uint64_t)(h + 2)};
             uint64_t globalStrides[2] = {
                 channels * sizeof(half),
-                w * channels * sizeof(half)
+                (w + 2) * channels * sizeof(half)
             };
             uint32_t boxDim[3] = {TILE_C, TILE_W, TILE_H};
             uint32_t elementStrides[3] = {1, 1, 1};
