@@ -1,1 +1,48 @@
-test_nvidia_voxelization
+# Compiled binaries
+*.o
+*.out
+*.exe
+
+# CUDA compilation artifacts
+*.ptx
+*.cubin
+*.fatbin
+
+# Build directories
+build/
+bin/
+
+# External repositories (should use submodules if needed)
+NVIDIA-Hopper-Benchmark/
+
+# Temporary and debug files
+tmp/
+debug/
+*.tmp
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Test outputs
+*.log
+*.bin
+!tma_experiments/working/*.bin
+
+# Compiled TMA experiments
+tma_experiments/benchmark_all
+tma_experiments/benchmark_comparison
+tma_experiments/benchmark_tma
+tma_experiments/test_*
+tma_experiments/tma_multibatch*
+tma_experiments/tma_multiscale
+tma_experiments/tma_warp_barrier
+tma_experiments/tma_data_loading

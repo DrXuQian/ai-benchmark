@@ -7,6 +7,26 @@
 
 // 真正的TMA实现 - 使用cp.async.bulk.tensor.3d PTX指令
 // 使用动态entry point获取cuTensorMapEncodeTiled (required for SM 12.0)
+//
+// CRITICAL: TMA Dimension Mapping for [H][W][C] Memory Layout
+// ============================================================
+// Memory layout: [H][W][C] (row-major, C is innermost/contiguous)
+// TMA dimensions: X, Y, Z map from innermost to outermost
+// Therefore:
+//   X = C (channels, innermost)
+//   Y = W (width)
+//   Z = H (height, outermost)
+//
+// Descriptor setup:
+//   globalDim = [C, W, H]
+//   stride[0] = C * sizeof(dtype)      // bytes to skip to next W
+//   stride[1] = W * C * sizeof(dtype)  // bytes to skip to next H
+//   boxDim = [32, 2, 2]                // load C=32, W=2, H=2
+//
+// PTX coordinates:
+//   coord_x = c (channel index, always 0 for full channel load)
+//   coord_y = w (width position)
+//   coord_z = h (height position)
 
 using TmaDescriptor = CUtensorMap;
 
@@ -83,7 +103,6 @@ __global__ void ms_deformable_im2col_tma_kernel(
 
     // Process each level
     for (int l_col = 0; l_col < NUM_LEVELS; ++l_col) {
-        const int level_start_id = data_level_start_index[l_col];
         const int spatial_h = data_spatial_shapes[l_col * 2];
         const int spatial_w = data_spatial_shapes[l_col * 2 + 1];
 
@@ -112,23 +131,24 @@ __global__ void ms_deformable_im2col_tma_kernel(
                 // Only one thread issues TMA for the entire warp
                 const int lane_id = threadIdx.x % 32;
                 if (lane_id == 0) {
-                    // TMA coordinates: load 2x2x32 tile starting at (hLow, wLow, 0)
-                    int32_t coord_h = hLow;
-                    int32_t coord_w = wLow;
-                    int32_t coord_c = 0;
+                    // TMA coordinates: X=C, Y=W, Z=H (innermost to outermost)
+                    // Load 2x2x32 tile starting at (hLow, wLow, 0)
+                    int32_t coord_c = 0;      // X coordinate (C=0)
+                    int32_t coord_w = wLow;   // Y coordinate (W)
+                    int32_t coord_h = hLow;   // Z coordinate (H)
 
                     // Issue TMA load using inline PTX
                     // cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
-                    //   [dstMem], [tensorMap, {coord_h, coord_w, coord_c}], [smem_bar];
+                    //   [dstMem], [tensorMap, {X, Y, Z}], [smem_bar];
                     asm volatile(
                         "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
                         " [%0], [%1, {%2, %3, %4}], [%5];"
                         :
                         : "r"(__as_ptr_smem(&smem_tile[0][0][0])),
                           "l"(tma_desc),
-                          "r"(coord_h),
-                          "r"(coord_w),
-                          "r"(coord_c),
+                          "r"(coord_c),  // X = C
+                          "r"(coord_w),  // Y = W
+                          "r"(coord_h),  // Z = H
                           "r"(__as_ptr_smem(&barrier))
                         : "memory"
                     );
@@ -220,25 +240,24 @@ CUresult createTMADescriptorsForAllBatches(
             printf("  Descriptor[%d][%d]: H=%d, W=%d, C=%d\n",
                    batch_idx, level, spatial_h, spatial_w, channels);
 
-            // Global tensor dimensions [H, W, C]
+            // Global tensor dimensions: X=C, Y=W, Z=H (innermost to outermost)
+            // For [H][W][C] memory layout, TMA X,Y,Z maps to C,W,H
             cuuint64_t globalDim[3] = {
-                (cuuint64_t)spatial_h,
-                (cuuint64_t)spatial_w,
-                (cuuint64_t)channels
+                (cuuint64_t)channels,    // X = C (innermost)
+                (cuuint64_t)spatial_w,   // Y = W
+                (cuuint64_t)spatial_h    // Z = H (outermost)
             };
 
-            // Strides in bytes - array has (rank-1) elements!
-            // For rank=3 tensor, need 2 strides
-            // stride[0] = bytes to skip to go from element[i][j][k] to element[i+1][j][k]
-            // stride[1] = bytes to skip to go from element[i][j][k] to element[i][j+1][k]
-            // stride for last dim (C) is implicit = sizeof(element)
+            // Strides in bytes for [H][W][C] memory layout
+            // stride[0] = bytes to skip from [h][w][c] to [h][w+1][c] (skip one column)
+            // stride[1] = bytes to skip from [h][w][c] to [h+1][w][c] (skip one row)
             cuuint64_t globalStrides[2] = {
-                spatial_w * channels * sizeof(__half),  // dim[0] stride (H)
-                channels * sizeof(__half)                // dim[1] stride (W)
+                channels * sizeof(__half),              // stride[0]: skip to next W
+                spatial_w * channels * sizeof(__half)   // stride[1]: skip to next H
             };
 
-            // Box/tile dimensions: 2x2x32
-            cuuint32_t boxDim[3] = {2, 2, 32};
+            // Box/tile dimensions: X=32 (C), Y=2 (W), Z=2 (H)
+            cuuint32_t boxDim[3] = {32, 2, 2};
 
             // Element strides: contiguous access pattern
             cuuint32_t elementStrides[3] = {1, 1, 1};
