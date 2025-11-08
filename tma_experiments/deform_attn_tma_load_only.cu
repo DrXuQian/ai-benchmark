@@ -95,6 +95,20 @@ __global__ void deform_attn_tma_load_kernel(
 
     const dtype kZERO = __float2half(0.0f);
 
+    // Prefetch TMA descriptors for this query's 4 levels into L2 cache
+    // This reduces descriptor access latency during TMA operations
+    if (tid == 0) {  // Only one thread needs to prefetch
+        #pragma unroll
+        for (int l = 0; l < NUM_LEVELS; l++) {
+            const CUtensorMap* desc_ptr = &tma_desc_level0 + l;
+            // prefetch.tensormap brings descriptor to L2 cache
+            asm volatile(
+                "prefetch.tensormap [%0];\n\t"
+                :: "l"(reinterpret_cast<uint64_t>(desc_ptr))
+            );
+        }
+    }
+
     if (p_col < NUM_POINTS) {
         // Process all 4 levels for this sampling point
         for (int l_col = 0; l_col < NUM_LEVELS; l_col++) {
