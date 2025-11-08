@@ -81,6 +81,22 @@ __global__ void tma_multibatch_multiscale_kernel(
     const int q_col = bid % num_query;
     const int p_col = warp_id;
 
+    // Prefetch TMA descriptors for this batch's 4 levels into L2 cache
+    // This reduces descriptor access latency during TMA operations
+    // Only one thread (warp 0, lane 0) needs to prefetch all 4 descriptors
+    if (lane_id == 0 && p_col == 0) {
+        #pragma unroll
+        for (int l = 0; l < NUM_LEVELS; l++) {
+            const int desc_idx = b_col * NUM_LEVELS + l;
+            const CUtensorMap* desc_ptr = &tma_descs_all[desc_idx];
+            // prefetch.tensormap brings descriptor to L2 cache
+            asm volatile(
+                "prefetch.tensormap [%0];\n\t"
+                :: "l"(reinterpret_cast<uint64_t>(desc_ptr))
+            );
+        }
+    }
+
     if (p_col < num_points) {
         // Process all 4 levels for this point
         for (int l_col = 0; l_col < NUM_LEVELS; l_col++) {
