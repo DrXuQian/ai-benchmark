@@ -11,6 +11,7 @@
 // Multi-Batch Multi-Scale TMA Loading with Per-Warp Barriers
 // Supports: 48 batches × 4 spatial scales × 8 points
 // Production-ready implementation for real deformable attention workloads
+// Uses 192 separate TMA descriptors (48 batches × 4 levels) for true multi-batch processing
 
 using barrier = cuda::barrier<cuda::thread_scope_block>;
 typedef __half dtype;
@@ -47,12 +48,10 @@ struct LevelConfig {
 __constant__ LevelConfig d_level_configs[NUM_LEVELS];
 
 // Multi-batch multi-scale TMA loading kernel
+// Now accepts array of TMA descriptors for all batch×level combinations
 __global__ void tma_multibatch_multiscale_kernel(
-    const __grid_constant__ CUtensorMap tma_desc_level0,
-    const __grid_constant__ CUtensorMap tma_desc_level1,
-    const __grid_constant__ CUtensorMap tma_desc_level2,
-    const __grid_constant__ CUtensorMap tma_desc_level3,
-    const dtype *sampling_loc,      // [batch][query][heads][levels][points][2]
+    const CUtensorMap* tma_descs_all,   // [batch][level] flattened array
+    const dtype *sampling_loc,          // [batch][query][heads][levels][points][2]
     const int batch_size,
     const int num_query,
     const int num_points,
@@ -117,12 +116,10 @@ __global__ void tma_multibatch_multiscale_kernel(
                     int32_t tensor_coord_w = wLow;
                     int32_t tensor_coord_h = hLow;
 
-                    // Select correct TMA descriptor for this level
-                    const CUtensorMap* tma_desc;
-                    if (l_col == 0) tma_desc = &tma_desc_level0;
-                    else if (l_col == 1) tma_desc = &tma_desc_level1;
-                    else if (l_col == 2) tma_desc = &tma_desc_level2;
-                    else tma_desc = &tma_desc_level3;
+                    // Select correct TMA descriptor for this batch and level
+                    // Index: batch * NUM_LEVELS + level
+                    const int desc_idx = b_col * NUM_LEVELS + l_col;
+                    const CUtensorMap* tma_desc = &tma_descs_all[desc_idx];
 
                     // Issue TMA load for this level
                     asm volatile(
@@ -231,54 +228,89 @@ int main() {
     printf("  Value data: %zu elements (%.2f MB)\n", h_value.size(), h_value.size() * sizeof(dtype) / (1024.0 * 1024.0));
     printf("  Sampling locations: %zu elements (%.2f MB)\n\n", h_sampling_loc.size(), h_sampling_loc.size() * sizeof(dtype) / (1024.0 * 1024.0));
 
-    // Allocate device memory for each level
-    dtype *d_value_levels[NUM_LEVELS];
-    CUtensorMap tma_descs[NUM_LEVELS];
+    // Allocate device memory for each BATCH and LEVEL
+    // Total: 48 batches × 4 levels = 192 separate buffers
+    dtype *d_value_levels[batch][NUM_LEVELS];
+    CUtensorMap h_tma_descs[batch][NUM_LEVELS];  // Host-side array
 
     auto cuTensorMapEncodeTiled_func = get_cuTensorMapEncodeTiled();
 
-    printf("Creating TMA descriptors for each level...\n");
+    printf("Creating TMA descriptors for all batch×level combinations...\n");
+    printf("  Total descriptors: %d × %d = %d\n", batch, NUM_LEVELS, batch * NUM_LEVELS);
+
+    // Calculate total memory needed
+    size_t total_value_memory = 0;
     for (int l = 0; l < NUM_LEVELS; l++) {
         size_t level_size = h_level_configs[l].H * h_level_configs[l].W * CHANNELS;
-        size_t start_offset = h_level_configs[l].start_index * CHANNELS;
-
-        CUDA_CHECK(cudaMalloc(&d_value_levels[l], level_size * sizeof(dtype)));
-        CUDA_CHECK(cudaMemcpy(d_value_levels[l],
-                              h_value.data() + start_offset,
-                              level_size * sizeof(dtype),
-                              cudaMemcpyHostToDevice));
-
-        // Create TMA descriptor for this level
-        uint64_t globalDim[3] = {CHANNELS, (uint64_t)h_level_configs[l].W, (uint64_t)h_level_configs[l].H};
-        uint64_t globalStrides[2] = {
-            CHANNELS * sizeof(dtype),
-            h_level_configs[l].W * CHANNELS * sizeof(dtype)
-        };
-        uint32_t boxDim[3] = {TILE_C, TILE_W, TILE_H};
-        uint32_t elementStrides[3] = {1, 1, 1};
-
-        CUresult res = cuTensorMapEncodeTiled_func(
-            &tma_descs[l],
-            CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
-            3,
-            d_value_levels[l],
-            globalDim,
-            globalStrides,
-            boxDim,
-            elementStrides,
-            CU_TENSOR_MAP_INTERLEAVE_NONE,
-            CU_TENSOR_MAP_SWIZZLE_NONE,
-            CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-            CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
-        );
-
-        if (res != CUDA_SUCCESS) {
-            printf("Failed to create TMA descriptor for level %d\n", l);
-            return 1;
-        }
-        printf("  ✓ Level %d: [%d×%d]\n", l, h_level_configs[l].H, h_level_configs[l].W);
+        total_value_memory += level_size * batch;
     }
-    printf("\n");
+    printf("  Total value data: %.2f MB (%.2f MB per batch)\n\n",
+           total_value_memory * sizeof(dtype) / (1024.0 * 1024.0),
+           total_value_memory * sizeof(dtype) / (1024.0 * 1024.0) / batch);
+
+    // Calculate single batch size in h_value
+    size_t single_batch_total_size = 0;
+    for (int l = 0; l < NUM_LEVELS; l++) {
+        single_batch_total_size += h_level_configs[l].H * h_level_configs[l].W * CHANNELS;
+    }
+
+    for (int b = 0; b < batch; b++) {
+        for (int l = 0; l < NUM_LEVELS; l++) {
+            size_t level_size = h_level_configs[l].H * h_level_configs[l].W * CHANNELS;
+            size_t batch_offset = b * single_batch_total_size;
+            size_t level_offset = h_level_configs[l].start_index * CHANNELS;
+            size_t start_offset = batch_offset + level_offset;
+
+            // Allocate device memory for this batch×level
+            CUDA_CHECK(cudaMalloc(&d_value_levels[b][l], level_size * sizeof(dtype)));
+
+            // Copy this batch's level data
+            CUDA_CHECK(cudaMemcpy(d_value_levels[b][l],
+                                  h_value.data() + start_offset,
+                                  level_size * sizeof(dtype),
+                                  cudaMemcpyHostToDevice));
+
+            // Create TMA descriptor for this batch×level combination
+            uint64_t globalDim[3] = {CHANNELS, (uint64_t)h_level_configs[l].W, (uint64_t)h_level_configs[l].H};
+            uint64_t globalStrides[2] = {
+                CHANNELS * sizeof(dtype),
+                h_level_configs[l].W * CHANNELS * sizeof(dtype)
+            };
+            uint32_t boxDim[3] = {TILE_C, TILE_W, TILE_H};
+            uint32_t elementStrides[3] = {1, 1, 1};
+
+            CUresult res = cuTensorMapEncodeTiled_func(
+                &h_tma_descs[b][l],
+                CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
+                3,
+                d_value_levels[b][l],
+                globalDim,
+                globalStrides,
+                boxDim,
+                elementStrides,
+                CU_TENSOR_MAP_INTERLEAVE_NONE,
+                CU_TENSOR_MAP_SWIZZLE_NONE,
+                CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+                CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+            );
+
+            if (res != CUDA_SUCCESS) {
+                printf("Failed to create TMA descriptor for batch %d, level %d\n", b, l);
+                return 1;
+            }
+        }
+        if ((b + 1) % 10 == 0 || b == batch - 1) {
+            printf("  ✓ Created descriptors for batches 0-%d\n", b);
+        }
+    }
+
+    // Copy TMA descriptors to device
+    CUtensorMap *d_tma_descs;
+    CUDA_CHECK(cudaMalloc(&d_tma_descs, batch * NUM_LEVELS * sizeof(CUtensorMap)));
+    CUDA_CHECK(cudaMemcpy(d_tma_descs, h_tma_descs,
+                          batch * NUM_LEVELS * sizeof(CUtensorMap),
+                          cudaMemcpyHostToDevice));
+    printf("  ✓ Copied all %d descriptors to device\n\n", batch * NUM_LEVELS);
 
     // Allocate sampling locations for ALL batches
     // We'll replicate the single batch data across 48 batches
@@ -311,8 +343,7 @@ int main() {
     printf("Warming up...\n");
     for (int i = 0; i < 3; i++) {
         tma_multibatch_multiscale_kernel<<<num_blocks, 256>>>(
-            tma_descs[0], tma_descs[1], tma_descs[2], tma_descs[3],
-            d_sampling_loc, batch, num_query, num_points, d_output);
+            d_tma_descs, d_sampling_loc, batch, num_query, num_points, d_output);
         CUDA_CHECK(cudaDeviceSynchronize());
     }
     printf("Warm up complete.\n\n");
@@ -331,8 +362,7 @@ int main() {
     for (int i = 0; i < iterations; i++) {
         CUDA_CHECK(cudaEventRecord(start));
         tma_multibatch_multiscale_kernel<<<num_blocks, 256>>>(
-            tma_descs[0], tma_descs[1], tma_descs[2], tma_descs[3],
-            d_sampling_loc, batch, num_query, num_points, d_output);
+            d_tma_descs, d_sampling_loc, batch, num_query, num_points, d_output);
         CUDA_CHECK(cudaEventRecord(stop));
         CUDA_CHECK(cudaEventSynchronize(stop));
 
@@ -440,9 +470,12 @@ int main() {
     // Cleanup
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
-    for (int l = 0; l < NUM_LEVELS; l++) {
-        CUDA_CHECK(cudaFree(d_value_levels[l]));
+    for (int b = 0; b < batch; b++) {
+        for (int l = 0; l < NUM_LEVELS; l++) {
+            CUDA_CHECK(cudaFree(d_value_levels[b][l]));
+        }
     }
+    CUDA_CHECK(cudaFree(d_tma_descs));
     CUDA_CHECK(cudaFree(d_sampling_loc));
     CUDA_CHECK(cudaFree(d_output));
 
