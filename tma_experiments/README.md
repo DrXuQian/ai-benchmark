@@ -8,6 +8,7 @@ This directory contains experiments and implementations for using NVIDIA Hopper'
 - Verified correct TMA dimension mapping: X→C, Y→W, Z→H for [H][W][C] layout
 - Achieved 95.6% accuracy on real test data
 - Identified root cause of 4.4% discrepancy: FP16 precision in coordinate calculation
+- **Benchmarked: TMA is 1.33x faster than manual loading (150 vs 109 GB/s)**
 
 ## Key Files
 
@@ -21,6 +22,11 @@ This directory contains experiments and implementations for using NVIDIA Hopper'
   - Matches deformable attention's bilinear sampling pattern
   - 4.4% discrepancy due to FP16 precision (expected behavior)
 - **`deform_attn_tma_match_original.cu`**: Full deformable attention with TMA
+
+### Benchmarks
+- **`benchmark_tma_loading.cu`**: Performance benchmark for TMA loading
+- **`benchmark_comparison.cu`**: TMA vs manual loading comparison
+- **`BENCHMARK_RESULTS.md`**: Detailed performance analysis and results
 
 ### Documentation
 - **`TMA_DIMENSION_MAPPING.md`**: Critical documentation of TMA dimension ordering and memory layout
@@ -74,12 +80,28 @@ globalStrides = {
 boxDim = {32, 2, 2};  // {C, W, H} - Load 2x2 spatial tile, 32 channels
 ```
 
-## Performance Notes
+## Performance Results
 
-- TMA eliminates explicit shared memory indexing
-- Enables hardware-managed asynchronous transfers
-- Critical for achieving high occupancy on Hopper/Blackwell GPUs
-- Requires careful barrier synchronization
+### Benchmark Summary (RTX 5070 - Blackwell sm_90)
+
+**TMA vs Manual Loading (1000 queries × 8 points)**
+- TMA: 13.1 μs, 150.78 GB/s
+- Manual: 17.5 μs, 109.29 GB/s
+- **Speedup: 1.33x faster with TMA**
+
+**TMA Metrics**
+- Kernel time: 12.6 μs (average)
+- TMA operations: 632 Million ops/s
+- Time per TMA load: 1.58 ns
+- Memory efficiency: 22.4% (limited by random access pattern)
+
+**Key Benefits**
+- Hardware-managed asynchronous transfers
+- Reduced instruction overhead
+- Better memory access optimization
+- Cleaner, more maintainable code
+
+See `BENCHMARK_RESULTS.md` for detailed analysis.
 
 ## Next Steps
 
