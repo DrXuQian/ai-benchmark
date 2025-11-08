@@ -1,282 +1,442 @@
-#include <cuda.h>
-#include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <cudaTypedefs.h>  // PFN_cuTensorMapEncodeTiled
-#include <cstdio>
-#include <cstdlib>
+#include <stdio.h>
+#include <stdlib.h>
+#include <float.h>
+#include <vector>
+#include <algorithm>
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda.h>
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <numeric>
+#include <stdexcept>
+#include <map>
 
-// 真正的TMA实现 - 使用cp.async.bulk.tensor.3d PTX指令
-// 使用动态entry point获取cuTensorMapEncodeTiled (required for SM 12.0)
-//
-// CRITICAL: TMA Dimension Mapping for [H][W][C] Memory Layout
-// ============================================================
-// Memory layout: [H][W][C] (row-major, C is innermost/contiguous)
-// TMA dimensions: X, Y, Z map from innermost to outermost
-// Therefore:
-//   X = C (channels, innermost)
-//   Y = W (width)
-//   Z = H (height, outermost)
-//
-// Descriptor setup:
-//   globalDim = [C, W, H]
-//   stride[0] = C * sizeof(dtype)      // bytes to skip to next W
-//   stride[1] = W * C * sizeof(dtype)  // bytes to skip to next H
-//   boxDim = [32, 2, 2]                // load C=32, W=2, H=2
-//
-// PTX coordinates:
-//   coord_x = c (channel index, always 0 for full channel load)
-//   coord_y = w (width position)
-//   coord_z = h (height position)
+#define TILE_H 2
+#define TILE_W 2
+#define TILE_C 32
 
-using TmaDescriptor = CUtensorMap;
+using barrier = cuda::barrier<cuda::thread_scope_block>;
 
-// Get cuTensorMapEncodeTiled function pointer dynamically
 inline PFN_cuTensorMapEncodeTiled get_cuTensorMapEncodeTiled() {
     cudaDriverEntryPointQueryResult driver_status;
     void* func_ptr = nullptr;
     cudaError_t err = cudaGetDriverEntryPoint("cuTensorMapEncodeTiled", &func_ptr,
                                                cudaEnableDefault, &driver_status);
-    if (err != cudaSuccess) {
-        printf("Failed to get cuTensorMapEncodeTiled: %s\n", cudaGetErrorString(err));
-        return nullptr;
-    }
-    return reinterpret_cast<PFN_cuTensorMapEncodeTiled>(func_ptr);
+    return (err == cudaSuccess) ? reinterpret_cast<PFN_cuTensorMapEncodeTiled>(func_ptr) : nullptr;
 }
 
-// Helper function to convert pointer to shared memory address
-__device__ __forceinline__ uint32_t __as_ptr_smem(const void* ptr) {
-    return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+inline int GET_BLOCKS(const int N, const int num_threads) {
+  return (N + num_threads - 1) / num_threads;
 }
+#define CUDA_1D_KERNEL_LOOP(i, n)                              \
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < (n); \
+       i += blockDim.x * gridDim.x)
+#define HALF2(value) (reinterpret_cast<half2*>(&(value))[0])
+#define LDST128BITS(value) (reinterpret_cast<float4*>(&(value))[0])
+#define FLOAT2(value) (reinterpret_cast<float2*>(&(value))[0])
+template <typename scalar_t=__half, const int NUM_POINT= 8, const int NUM_LEVELS=4, const int CHANNELS = 32, 
+                                    const int POINT_SHIFT=3, const int LEVEL_SHIFT=2, const int CHANNELS_SHIFT=5,
+                                    const int NUM_OUTPUT=8, const int NUM_OUTPUT_SHIFT=3, const int STAGES=1>
+__global__ void ms_deformable_im2col_gpu_kernel_template(
+    const int n, const scalar_t *data_value, const int64_t *data_spatial_shapes,
+    const int64_t *data_level_start_index, const scalar_t *data_sampling_loc,
+    const scalar_t *data_attn_weight, const int batch_size,
+    const int spatial_size, const int num_query,
+    const CUtensorMap* d_tma_descs, scalar_t *data_col) {
+    CUDA_1D_KERNEL_LOOP(index, n) {
+    int _temp = index << NUM_OUTPUT_SHIFT;
+    const int c_col = _temp & (CHANNELS -1 ); //_temp % CHANNELS;
+    _temp = (_temp >> CHANNELS_SHIFT);
+    const int sampling_index = _temp;
+    const int b_col = (float)_temp/(float)num_query;
+    const __half kZERO = __int2half_rz(0);
+    const __half kONE = __int2half_rz(1);
+    int32_t const wStride = CHANNELS; // 256 
 
-template <typename scalar_t, const int NUM_POINT=8, const int NUM_LEVELS=4,
-          const int CHANNELS=32, const int NUM_OUTPUT=8>
-__global__ void ms_deformable_im2col_tma_kernel(
-    const int n,
-    const scalar_t *data_value,
-    const TmaDescriptor *tma_descriptors,  // One descriptor per batch*level
-    const int64_t *data_spatial_shapes,
-    const int64_t *data_level_start_index,
-    const scalar_t *data_sampling_loc,
-    const scalar_t *data_attn_weight,
-    const int batch_size,
-    const int spatial_size,
-    const int num_query,
-    scalar_t *data_col
-) {
-    // Shared memory for 2x2x32 tile
-    __shared__ __align__(128) scalar_t smem_tile[2][2][CHANNELS];
+    scalar_t *data_col_ptr = data_col + (index << NUM_OUTPUT_SHIFT);
+    int data_weight_ptr = sampling_index << (LEVEL_SHIFT + POINT_SHIFT); // * NUM_LEVELS * NUM_POINT;
+    int data_loc_w_ptr = data_weight_ptr << 1;
+    const int data_value_ptr_init_offset = (b_col * spatial_size) << CHANNELS_SHIFT;
 
-    // Barrier for TMA synchronization
-    __shared__ __align__(8) uint64_t barrier;
-
-    // Initialize barrier
-    if (threadIdx.x == 0) {
-        asm volatile("mbarrier.init.shared.b64 [%0], %1;"
-                     :: "r"(__as_ptr_smem(&barrier)), "r"(1));
-    }
-    __syncthreads();
-
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= n) return;
-
-    // Calculate output position
-    int output_offset = index * NUM_OUTPUT;
-    int c_col = output_offset & (CHANNELS - 1);
-    int temp = output_offset >> 5;  // Divide by CHANNELS
-    int sampling_index = temp;
-    int b_col = temp / num_query;
-
-    scalar_t *data_col_ptr = data_col + output_offset;
-
-    // Initialize accumulator
     scalar_t col[NUM_OUTPUT];
     #pragma unroll
-    for (int i = 0; i < NUM_OUTPUT; i++) {
-        col[i] = __float2half(0.0f);
+    for (int idx = 0; idx < (NUM_OUTPUT >> 1); idx += 1) {
+        reinterpret_cast<__half2*>(col)[idx] = half2(0.0f, 0.0f);
+    }
+    scalar_t *data_half = const_cast<scalar_t *>(data_sampling_loc);
+    scalar_t *data_attn_weight_half = const_cast<scalar_t *>(data_attn_weight);
+
+    const half2 zp5 = half2(0.5f, 0.5f);
+
+    const int lane_id = tid % 32;
+    const int warp_id = tid / 32;
+    const int query_id_in_warp = lane_id >> 2;
+    const int is_loader_thread = lane_id % 4 == 0;
+    const int n_warp = gridDimx.x;
+    const int query_in_warp = 32 / (CHANNELS / NUM_OUTPUT);
+    __shared__ alignas(128) scalar_t smem_tile[STAGES][n_warp][query_in_warp][2][2][32];
+
+    // Per-warp barriers
+    #pragma nv_diag_suppress static_var_with_dynamic_init
+    __shared__ barrier warp_bars[8];
+    if (lane_id == 0) {
+        init(&warp_bars[warp_id], 32);
+        asm volatile("fence.proxy.async.shared::cta;");
+    }
+    __syncwarp();
+    // Prefetch TMA descriptors for this batch's 4 levels into L2 cache
+    // This reduces descriptor access latency during TMA operations
+    // Only one thread (warp 0, lane 0) needs to prefetch all 4 descriptors
+    if (lane_id == 0 && warp_id == 0) {
+        #pragma unroll
+        for (int l = 0; l < NUM_LEVELS; l++) {
+            const int desc_idx = b_col * NUM_LEVELS + l;
+            const CUtensorMap* desc_ptr = &tma_descs_all[desc_idx];
+            // prefetch.tensormap brings descriptor to L2 cache
+            asm volatile(
+                "prefetch.tensormap [%0];\n\t"
+                :: "l"(reinterpret_cast<uint64_t>(desc_ptr))
+            );
+        }
     }
 
-    int data_weight_ptr = sampling_index * NUM_LEVELS * NUM_POINT;
-    int data_loc_ptr = data_weight_ptr * 2;
 
-    const scalar_t kZERO = __float2half(0.0f);
-    const scalar_t kONE = __float2half(1.0f);
-
-    // Process each level
     for (int l_col = 0; l_col < NUM_LEVELS; ++l_col) {
-        const int spatial_h = data_spatial_shapes[l_col * 2];
-        const int spatial_w = data_spatial_shapes[l_col * 2 + 1];
+      const int level_start_id = data_level_start_index[l_col];
+      const int spatial_h_ptr = l_col << 1;
+      const int spatial_h = data_spatial_shapes[spatial_h_ptr];
+      const int spatial_w = data_spatial_shapes[spatial_h_ptr + 1];
+      int32_t const hStride = (spatial_w + 2) << CHANNELS_SHIFT;
+      // h -> hight , w -> low 
+      const half2 spatail_hw = half2(spatial_w, spatial_h);
 
-        // Get TMA descriptor for this batch and level
-        const TmaDescriptor* tma_desc = &tma_descriptors[b_col * NUM_LEVELS + l_col];
+      const scalar_t *data_value_ptr =
+          data_value +
+          (data_value_ptr_init_offset + (level_start_id << (CHANNELS_SHIFT)));
+      // load data_sampling_loc and  data_attn_weight for NUM_POINT
+      // NUM_POINT 4;
+      half2 loc_hw_vec[NUM_POINT]; // 8 FP16 = 128 bit  
+      half  weight_vec[NUM_POINT]; // 4 FP16 = 64 bit 
 
-        // Process each sampling point
-        for (int p_col = 0; p_col < NUM_POINT; ++p_col) {
-            // Get sampling location
-            scalar_t loc_w = data_sampling_loc[data_loc_ptr + p_col * 2];
-            scalar_t loc_h = data_sampling_loc[data_loc_ptr + p_col * 2 + 1];
-            scalar_t weight = data_attn_weight[data_weight_ptr + p_col];
+      #pragma unroll
+      for (int pack_id = 0; pack_id < NUM_POINT; pack_id += 4){
+        LDST128BITS(loc_hw_vec[pack_id]) = __ldcg(reinterpret_cast<float4*>(&data_half[data_loc_w_ptr + (pack_id << 1)]));
+      }
+      #pragma unroll
+      for (int pack_id = 0; pack_id < NUM_POINT; pack_id += 8){
+        // FLOAT2(weight_vec[pack_id])      = FLOAT2(data_attn_weight_half[data_weight_ptr + pack_id]) ;
+        LDST128BITS(weight_vec[pack_id])      = __ldcg(reinterpret_cast<float4*>(&data_attn_weight_half[data_weight_ptr + pack_id]));
+      }
+      data_loc_w_ptr += (NUM_POINT << 1);
+      data_weight_ptr += NUM_POINT;
+      #pragma unroll
+      for (int p_col = 0; p_col < NUM_POINT; ++p_col) {
+        const half2 loc = loc_hw_vec[p_col]; 
+        const scalar_t weight = weight_vec[p_col];
+        half2 weighthalf2 = half2(weight, weight);
+        half2 hw_im = __hfma2(loc, spatail_hw, zp5);
+        scalar_t h_im = __high2half(hw_im);
+        scalar_t w_im = __low2half(hw_im);
 
-            // Convert to image coordinates
-            scalar_t w_im = __hfma(loc_w, __int2half_rn(spatial_w), __float2half(0.5f));
-            scalar_t h_im = __hfma(loc_h, __int2half_rn(spatial_h), __float2half(0.5f));
+        const int within_range = (h_im > (scalar_t)(0) && 
+                                  w_im > (scalar_t)(0) && 
+                                  h_im < (scalar_t)(spatial_h + 1) && 
+                                  w_im < (scalar_t)(spatial_w + 1));
+        int32_t const hLow = __half2int_rd(h_im);
+        int32_t const wLow = __half2int_rd(w_im);
+        int32_t const hHigh = hLow + 1;
+        int32_t const wHigh = wLow + 1;
 
-            // Check bounds
-            if (h_im > kZERO && w_im > kZERO &&
-                h_im < __int2half_rn(spatial_h + 1) &&
-                w_im < __int2half_rn(spatial_w + 1)) {
+        if (is_loader_thread and within_range) {
+            // TMA coordinates: X=C, Y=W, Z=H
+            int32_t tensor_coord_c = 0;
+            int32_t tensor_coord_w = wLow;
+            int32_t tensor_coord_h = hLow;
 
-                int hLow = __half2int_rd(h_im);
-                int wLow = __half2int_rd(w_im);
+            // Select correct TMA descriptor for this batch and level
+            // Index: batch * NUM_LEVELS + level
+            const int desc_idx = b_col * NUM_LEVELS + l_col;
+            const CUtensorMap* tma_desc = &tma_descs_all[desc_idx];
 
-                // Only one thread issues TMA for the entire warp
-                const int lane_id = threadIdx.x % 32;
-                if (lane_id == 0) {
-                    // TMA coordinates: X=C, Y=W, Z=H (innermost to outermost)
-                    // Load 2x2x32 tile starting at (hLow, wLow, 0)
-                    int32_t coord_c = 0;      // X coordinate (C=0)
-                    int32_t coord_w = wLow;   // Y coordinate (W)
-                    int32_t coord_h = hLow;   // Z coordinate (H)
+            // Issue TMA load for this level
+            asm volatile(
+                "{\n\t"
+                "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
+                " [%0], [%1, {%2, %3, %4}], [%5];\n\t"
+                "}"
+                :
+                : "r"(static_cast<unsigned>(__cvta_generic_to_shared(&smem_tile[0][warp_id][query_id_in_warp][0][0][0]))),
+                "l"(reinterpret_cast<uint64_t>(tma_desc)),
+                "r"(tensor_coord_c), "r"(tensor_coord_w), "r"(tensor_coord_h),
+                "r"(static_cast<unsigned>(__cvta_generic_to_shared(&warp_bars[warp_id])))
+                : "memory"
+            );
 
-                    // Issue TMA load using inline PTX
-                    // cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
-                    //   [dstMem], [tensorMap, {X, Y, Z}], [smem_bar];
-                    asm volatile(
-                        "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
-                        " [%0], [%1, {%2, %3, %4}], [%5];"
-                        :
-                        : "r"(__as_ptr_smem(&smem_tile[0][0][0])),
-                          "l"(tma_desc),
-                          "r"(coord_c),  // X = C
-                          "r"(coord_w),  // Y = W
-                          "r"(coord_h),  // Z = H
-                          "r"(__as_ptr_smem(&barrier))
-                        : "memory"
-                    );
+            asm volatile(
+                "mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;\n\t"
+                :
+                : "r"(static_cast<unsigned>(__cvta_generic_to_shared(&warp_bars[warp_id]))),
+                    "n"(2 * 2 * 32 * sizeof(scalar_t))
+            );
+        }else {
+            // Out of bounds - expect 0 bytes
+            asm volatile(
+                "mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;\n\t"
+                :
+                : "r"(static_cast<unsigned>(__cvta_generic_to_shared(&warp_bars[warp_id]))),
+                    "n"(0)
+            );
+        }
+        // Warp waits for this level's TMA to complete
+        barrier::arrival_token token = warp_bars[warp_id].arrive();
+        warp_bars[warp_id].wait(std::move(token));
 
-                    // Wait for TMA to complete
-                    asm volatile(
-                        "{\n\t"
-                        "  .reg .pred p;\n\t"
-                        "  .reg .b32 r_bar;\n\t"
-                        "  mov.b32 r_bar, %0;\n\t"
-                        "$wait_loop_%=:\n\t"
-                        "  mbarrier.try_wait.parity.shared.b64 p, [r_bar], 0;\n\t"
-                        "  @!p bra $wait_loop_%=;\n\t"
-                        "}\n\t"
-                        :
-                        : "r"(__as_ptr_smem(&barrier))
-                    );
-                }
-
-                // All threads wait for TMA completion
-                __syncwarp();
-
-                // Compute bilinear interpolation
-                scalar_t lh = __hsub(h_im, __int2half_rd(hLow));
-                scalar_t lw = __hsub(w_im, __int2half_rd(wLow));
-                scalar_t hh = __hsub(kONE, lh);
-                scalar_t hw = __hsub(kONE, lw);
-
-                scalar_t w00 = __hmul(hh, hw);
-                scalar_t w01 = __hmul(hh, lw);
-                scalar_t w10 = __hmul(lh, hw);
-                scalar_t w11 = __hmul(lh, lw);
-
-                // Interpolate and accumulate
+        if (within_range){
+            const __half lh = __hsub(h_im, __int2half_rd(hLow));
+            const __half lw = __hsub(w_im, __int2half_rd(wLow));
+            const __half hh = __hsub(kONE, lh), hw = __hsub(kONE, lw);
+            int32_t const hLowPtrOffset = hLow * hStride;
+            int32_t const hHighPtrOffset = hLowPtrOffset + hStride;
+            int32_t const wLowPtrOffset = wLow << CHANNELS_SHIFT;
+            int32_t const wHighPtrOffset = wLowPtrOffset + wStride;
+            __half pst_lh[4] = {hh, hh, lh, lh};
+            __half pst_rh[4] = {hw, lw, hw, lw};
+            __half wdata[4] ;
+            HALF2(wdata[0]) = __hmul2(HALF2(pst_lh[0]), HALF2(pst_rh[0]));
+            HALF2(wdata[2]) = __hmul2(HALF2(pst_lh[2]), HALF2(pst_rh[2]));
+            // // expand wdata from [w0, w1, w2, w3] to  [w0, w0, w1, w1, w2, w2, ..., w3, w3]
+            __half wdataexp[2];
+            __half vdata2d[NUM_OUTPUT] ; 
+            int32_t const ptr1 = hLowPtrOffset + wLowPtrOffset + c_col;
+            HALF2(wdataexp[0]) = __hmul2(half2(wdata[0],  wdata[0]), HALF2(weighthalf2));
+            #pragma unroll
+            for (int j = 0; j < NUM_OUTPUT; j += 8){
+                // LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(smem_tile[0][warp_id][query_id_in_warp][0][0][c_col]));
+                LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(data_value_ptr)[ptr1 + j]);
                 #pragma unroll
-                for (int c = 0; c < NUM_OUTPUT; c++) {
-                    int ch_idx = (c_col + c) % CHANNELS;
-
-                    scalar_t val = __hfma(w00, smem_tile[0][0][ch_idx],
-                                  __hfma(w01, smem_tile[0][1][ch_idx],
-                                  __hfma(w10, smem_tile[1][0][ch_idx],
-                                  __hmul(w11, smem_tile[1][1][ch_idx]))));
-
-                    col[c] = __hfma(weight, val, col[c]);
+                for (int p = 0; p < 8; p += 2){
+                HALF2(col[p]) = __hfma2(HALF2(wdataexp[0]), HALF2(vdata2d[p]), HALF2(col[p]));
                 }
-
-                // Reset barrier for next iteration
-                if (lane_id == 0) {
-                    asm volatile("mbarrier.init.shared.b64 [%0], %1;"
-                                 :: "r"(__as_ptr_smem(&barrier)), "r"(1));
+            }
+            HALF2(wdataexp[0]) = __hmul2(half2(wdata[1],  wdata[1]), HALF2(weighthalf2));
+            int32_t const ptr2 = hLowPtrOffset + wHighPtrOffset + c_col;
+            #pragma unroll
+            for (int j = 0; j < NUM_OUTPUT; j += 8){
+                // LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(smem_tile[0][warp_id][query_id_in_warp][0][1][c_col]));
+                LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(data_value_ptr)[ptr2 + j]);
+                #pragma unroll
+                for (int p = 0; p < 8; p += 2){
+                HALF2(col[p]) = __hfma2(HALF2(wdataexp[0]), HALF2(vdata2d[p]), HALF2(col[p]));
                 }
-                __syncwarp();
+            }
+            int32_t const ptr3 = hHighPtrOffset + wLowPtrOffset + c_col;
+            HALF2(wdataexp[0]) = __hmul2(half2(wdata[2],  wdata[2]), HALF2(weighthalf2));
+            #pragma unroll
+            for (int j = 0; j < NUM_OUTPUT; j += 8){
+                // LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(smem_tile[0][warp_id][query_id_in_warp][1][0][c_col]));
+                LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(data_value_ptr)[ptr3 + j]);
+                #pragma unroll
+                for (int p = 0; p < 8; p += 2){
+                HALF2(col[p]) = __hfma2(HALF2(wdataexp[0]), HALF2(vdata2d[p]), HALF2(col[p]));
+                }
+            }
+            int32_t const ptr4 = hHighPtrOffset + wHighPtrOffset + c_col;
+            HALF2(wdataexp[0]) = __hmul2(half2(wdata[3],  wdata[3]), HALF2(weighthalf2));
+            #pragma unroll
+            for (int j = 0; j < NUM_OUTPUT; j += 8){
+                // LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(smem_tile[0][warp_id][query_id_in_warp][1][1][c_col]));
+                LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(data_value_ptr)[ptr4 + j]);
+                #pragma unroll
+                for (int p = 0; p < 8; p += 2){
+                HALF2(col[p]) = __hfma2(HALF2(wdataexp[0]), HALF2(vdata2d[p]), HALF2(col[p]));
+                }
             }
         }
-
-        data_loc_ptr += NUM_POINT * 2;
-        data_weight_ptr += NUM_POINT;
+      }
     }
-
-    // Write output
     #pragma unroll
-    for (int i = 0; i < NUM_OUTPUT; i++) {
-        data_col_ptr[i] = col[i];
+    for (int idx = 0; idx < NUM_OUTPUT; idx += 8){
+      // LDST128BITS(*data_col_ptr) = LDST128BITS(col[idx]);
+      __stcg(reinterpret_cast<float4*>(data_col_ptr), *reinterpret_cast<float4*>(&col[idx]));
+      data_col_ptr += 8;
+    }
+  }
+}
+template <typename scalar_t=__half, const int THREADS_IN_ONE_BLOCK=512, const int OUTPUTS_IN_THREAD=8, const int OUTPUTS_SHIFT=3>
+void ms_deformable_im2col_cuda(cudaStream_t stream, const scalar_t *data_value,
+                               const int64_t *data_spatial_shapes,
+                               const int64_t *data_level_start_index,
+                               const scalar_t *data_sampling_loc,
+                               const scalar_t *data_attn_weight,
+                               const int batch_size, const int spatial_size,
+                               const int num_heads, const int channels,
+                               const int num_levels, const int num_query,
+                               const int num_point, const CUtensorMap* d_tma_descs, scalar_t *data_col) {
+  const int num_kernels = batch_size * num_query * num_heads * channels / OUTPUTS_IN_THREAD;
+  const int num_actual_kernels = batch_size * num_query * num_heads * channels / OUTPUTS_IN_THREAD;
+  // 8 warp, optimal threads for MIG 
+  const int num_threads = THREADS_IN_ONE_BLOCK;
+  if (num_heads == 1 and num_point == 8 and num_levels == 4 and channels == 32){
+        ms_deformable_im2col_gpu_kernel_template<scalar_t, 8, 4, 32, 3, 2, 5, OUTPUTS_IN_THREAD, OUTPUTS_SHIFT>
+          <<<GET_BLOCKS(num_actual_kernels, num_threads), num_threads, 0, stream>>>(
+              num_kernels, data_value, data_spatial_shapes, data_level_start_index,
+              data_sampling_loc, data_attn_weight, batch_size, spatial_size,
+              num_query, d_tma_descs, data_col);
+  }
+
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    printf("error in ms_deformable_im2col_cuda: %s\n", cudaGetErrorString(err));
+  }
+}
+
+// 辅助函数：从 .bin 文件读取数据到 std::vector
+template <typename T>
+std::vector<T> read_bin_file(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        throw std::runtime_error("Cannot open file: " + path);
+    }
+    file.seekg(0, std::ios::end);
+    long long file_size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    std::vector<T> data(file_size / sizeof(T));
+    file.read(reinterpret_cast<char*>(data.data()), file_size);
+    return data;
+}
+
+template<typename T>
+T get_param(const std::map<std::string, std::string>& args, const std::string& key, T default_value) {
+    if (args.count(key)) {
+        try {
+            // 1. 如果 T 是 std::string，直接返回值
+            if constexpr (std::is_same_v<T, std::string>) {
+                return args.at(key);
+            } // 2. 如果 T 是整数类型
+            else if constexpr (std::is_integral_v<T>) {
+                return static_cast<T>(std::stoll(args.at(key)));
+            }
+            // 3. 如果 T 是浮点数类型
+            else if constexpr (std::is_floating_point_v<T>) {
+                return static_cast<T>(std::stod(args.at(key))); }
+            // 4. (可选) 如果有其他类型，可以在这里添加
+            else {
+            // 如果遇到不支持的类型，在编译时就报错
+                static_assert(sizeof(T) == 0, "Unsupported type for get_param");
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: Could not parse '" << key << "'. Using default value." << std::endl;
+            // 注意：不打印 e.what() 和 default_value，因为类型可能不支持 << 操作符
+            return default_value;
+        }
+    }
+    return default_value;
+}
+
+// 函数检查 CUDA API 调用的返回值
+#define CUDA_CHECK(ans) { cudaAssert((ans), __FILE__, __LINE__); }
+inline void cudaAssert(cudaError_t err, const char *file, int line, bool abort = true) {
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error: %s %s %d\n", cudaGetErrorString(err), file, line);
+        if (abort) exit(err);
     }
 }
 
-// Host function to create TMA descriptors for all batches and levels
-extern "C"
-CUresult createTMADescriptorsForAllBatches(
-    TmaDescriptor* h_descriptors,  // Output: array of descriptors [batch_size * num_levels]
-    const void** d_value_ptrs,      // Input: device pointers for each batch
-    const int64_t* h_spatial_shapes, // [num_levels * 2]: (H, W) for each level
-    const int64_t* h_level_start_index, // [num_levels]: start index for each level
-    int batch_size,
-    int num_levels,
-    int channels
-) {
-    printf("Creating TMA descriptors: batch_size=%d, num_levels=%d, channels=%d\n",
-           batch_size, num_levels, channels);
+// 解析命令行参数的辅助函数
+std::map<std::string, std::string> parse_args(int argc, char* argv[]) {
+    std::map<std::string, std::string> args_map;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        size_t pos = arg.find('=');
+        if (pos != std::string::npos) {
+            std::string key = arg.substr(0, pos);
+            std::string value = arg.substr(pos + 1);
+            args_map[key] = value;
+        }
+    }
+    return args_map;
+}
 
-    for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-        for (int level = 0; level < num_levels; ++level) {
-            int descriptor_idx = batch_idx * num_levels + level;
+int main(int argc, char* argv[]) {
+    // === 1. 解析命令行参数 ===
+    if (argc == 1) {
+        std::cout << "Usage: " << argv[0] << " [key=value] ..." << std::endl;
+        std::cout << "Example: " << argv[0] << " batch=48 spatial_size=20522 dir=data/binary_400x800/cross_attention_cut" << std::endl;
+        std::cout << "\nRequired parameters:" << std::endl;
+        std::cout << "  batch, spatial_size, num_query, num_heads, channels, num_levels, num_points, im2col_step" << std::endl;
+        std::cout << "Optional parameters:" << std::endl;
+        std::cout << "  dir (default: data/binary_400x800/cross_attention)" << std::endl;
+        return 1;
+    }
+    auto args = parse_args(argc, argv);
+    // === 2. 从解析的参数中获取元数据和维度 ===
+    const int batch               = get_param<int>(args, "batch", 48);
+    const int spatial_size        = get_param<int>(args, "spatial_size", 20522); 
+    const int num_query           = get_param<int>(args, "num_query", 123376);
+    const int num_heads           = get_param<int>(args, "num_heads", 1);
+    const int channels            = get_param<int>(args, "channels", 32);
+    const int num_levels          = get_param<int>(args, "num_levels", 4);
+    const int num_points          = get_param<int>(args, "num_points", 8);
+    const int im2col_step         = get_param<int>(args, "im2col_step", 64);
+    const std::string data_dir    = get_param<std::string>(args, "dir", "data/binary_400x800/cross_attention");
+ 
+    // 根据维度计算元素数量
+    long long value_elements = batch * num_query * num_heads * channels;
+    long long spatial_shapes_elements = num_levels * 2;
+    std::cout << "\nLoading data from .bin files in '" << data_dir << "'..." << std::endl;
+    auto h_value = read_bin_file<__half>(data_dir + "/value.bin");
+    auto h_spatial_shapes = read_bin_file<int64_t>(data_dir + "/spatial_shapes.bin");
+    auto h_level_start_index = read_bin_file<int64_t>(data_dir + "/level_start_index.bin");
+    auto h_sampling_loc = read_bin_file<__half>(data_dir + "/sampling_locations.bin");
+    auto h_attn_weight = read_bin_file<__half>(data_dir + "/attention_weights.bin");
+    __half* d_value, *d_sampling_loc, *d_attn_weight, *d_output;
+    int64_t* d_spatial_shapes;
+    int64_t* d_level_start_index;
 
-            const int spatial_h = h_spatial_shapes[level * 2];
-            const int spatial_w = h_spatial_shapes[level * 2 + 1];
-            const int level_start = h_level_start_index[level];
 
-            printf("  Descriptor[%d][%d]: H=%d, W=%d, C=%d\n",
-                   batch_idx, level, spatial_h, spatial_w, channels);
+    CUDA_CHECK(cudaMalloc(&d_value, h_value.size() * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_spatial_shapes, h_spatial_shapes.size() * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&d_level_start_index, h_level_start_index.size() * sizeof(int64_t)));
+    CUDA_CHECK(cudaMalloc(&d_sampling_loc, h_sampling_loc.size() * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_attn_weight, h_attn_weight.size() * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&d_output, value_elements * sizeof(__half)));
+    std::cout << "Copying data from Host to Device..." << std::endl;
+    CUDA_CHECK(cudaMemcpy(d_value, h_value.data(), h_value.size() * sizeof(__half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_spatial_shapes, h_spatial_shapes.data(), h_spatial_shapes.size() * sizeof(int64_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_level_start_index, h_level_start_index.data(), h_level_start_index.size() * sizeof(int64_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_sampling_loc, h_sampling_loc.data(), h_sampling_loc.size() * sizeof(__half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_attn_weight, h_attn_weight.data(), h_attn_weight.size() * sizeof(__half), cudaMemcpyHostToDevice));
+    
+    
+    // Allocate device memory for each BATCH and LEVEL
+    // Total: 48 batches × 4 levels = 192 separate buffers
+    CUtensorMap h_tma_descs[batch][num_levels];  // Host-side array
+    auto cuTensorMapEncodeTiled_func = get_cuTensorMapEncodeTiled();
+    single_batch_total_size = spatial_size * channels;
+    for (int b = 0; b < batch; b++) {
+        for (int l = 0; l < num_levels; l++) {
+            size_t batch_offset = b * single_batch_total_size;
+            auto value_of_batch = d_value + batch_offset;
+            int h = d_spatial_shapes[l * 2];
+            int w = d_spatial_shapes[l * 2 + 1];
 
-            // Global tensor dimensions: X=C, Y=W, Z=H (innermost to outermost)
-            // For [H][W][C] memory layout, TMA X,Y,Z maps to C,W,H
-            cuuint64_t globalDim[3] = {
-                (cuuint64_t)channels,    // X = C (innermost)
-                (cuuint64_t)spatial_w,   // Y = W
-                (cuuint64_t)spatial_h    // Z = H (outermost)
+            // Create TMA descriptor for this batch×level combination
+            uint64_t globalDim[3] = {channels, w + 2, h + 2};
+            uint64_t globalStrides[2] = {
+                channels * sizeof(half),
+                w * channels * sizeof(half)
             };
-
-            // Strides in bytes for [H][W][C] memory layout
-            // stride[0] = bytes to skip from [h][w][c] to [h][w+1][c] (skip one column)
-            // stride[1] = bytes to skip from [h][w][c] to [h+1][w][c] (skip one row)
-            cuuint64_t globalStrides[2] = {
-                channels * sizeof(__half),              // stride[0]: skip to next W
-                spatial_w * channels * sizeof(__half)   // stride[1]: skip to next H
-            };
-
-            // Box/tile dimensions: X=32 (C), Y=2 (W), Z=2 (H)
-            cuuint32_t boxDim[3] = {32, 2, 2};
-
-            // Element strides: contiguous access pattern
-            cuuint32_t elementStrides[3] = {1, 1, 1};
-
-            // Offset pointer for this level
-            const void* level_ptr = (const __half*)d_value_ptrs[batch_idx] + level_start * channels;
-
-            // Get function pointer dynamically
-            static auto cuTensorMapEncodeTiled_func = get_cuTensorMapEncodeTiled();
-            if (!cuTensorMapEncodeTiled_func) {
-                printf("ERROR: Failed to get cuTensorMapEncodeTiled function pointer\n");
-                return CUDA_ERROR_NOT_SUPPORTED;
-            }
-
-            CUresult result = cuTensorMapEncodeTiled_func(
-                &h_descriptors[descriptor_idx],
+            uint32_t boxDim[3] = {TILE_C, TILE_W, TILE_H};
+            uint32_t elementStrides[3] = {1, 1, 1};
+            auto _value = value_of_batch + d_level_start_index[l] * channels;
+            CUresult res = cuTensorMapEncodeTiled_func(
+                &h_tma_descs[b][l],
                 CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
-                3,  // rank
-                (void*)level_ptr,
+                3,
+                _value,
                 globalDim,
                 globalStrides,
                 boxDim,
@@ -287,79 +447,57 @@ CUresult createTMADescriptorsForAllBatches(
                 CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
             );
 
-            if (result != CUDA_SUCCESS) {
-                const char* error_name;
-                cuGetErrorName(result, &error_name);
-                printf("  ERROR: Failed to create descriptor[%d][%d]: %s\n",
-                       batch_idx, level, error_name);
-                return result;
+            if (res != CUDA_SUCCESS) {
+                printf("Failed to create TMA descriptor for batch %d, level %d\n", b, l);
+                return 1;
             }
+        }
+        if ((b + 1) % 10 == 0 || b == batch - 1) {
+            printf("  ✓ Created descriptors for batches 0-%d\n", b);
         }
     }
 
-    printf("✓ All TMA descriptors created successfully\n");
-    return CUDA_SUCCESS;
-}
-
-// Host launch function
-template <typename scalar_t>
-void ms_deformable_im2col_cuda_tma(
-    cudaStream_t stream,
-    const scalar_t* data_value,
-    const TmaDescriptor* tma_descriptors,
-    const int64_t* data_spatial_shapes,
-    const int64_t* data_level_start_index,
-    const scalar_t* data_sampling_loc,
-    const scalar_t* data_attn_weight,
-    const int batch_size,
-    const int spatial_size,
-    const int num_heads,
-    const int channels,
-    const int num_levels,
-    const int num_query,
-    const int num_point,
-    scalar_t* data_col)
-{
-    const int num_kernels = batch_size * num_query * num_heads * channels / 8;
-    const int num_threads = 256;
-
-    if (num_kernels == 0) return;
-
-    if (channels == 32 && num_levels == 4 && num_point == 8) {
-        ms_deformable_im2col_tma_kernel<scalar_t, 8, 4, 32, 8>
-            <<<(num_kernels + num_threads - 1) / num_threads, num_threads, 0, stream>>>(
-                num_kernels,
-                data_value,
-                tma_descriptors,
-                data_spatial_shapes,
-                data_level_start_index,
-                data_sampling_loc,
-                data_attn_weight,
-                batch_size,
-                spatial_size,
-                num_query,
-                data_col
-            );
-    } else {
-        printf("Unsupported configuration: channels=%d, levels=%d, points=%d\n",
-               channels, num_levels, num_point);
+    // Copy TMA descriptors to device
+    CUtensorMap *d_tma_descs;
+    CUDA_CHECK(cudaMalloc(&d_tma_descs, batch * num_levels * sizeof(CUtensorMap)));
+    CUDA_CHECK(cudaMemcpy(d_tma_descs, h_tma_descs,
+                          batch * num_levels * sizeof(CUtensorMap),
+                          cudaMemcpyHostToDevice));
+    printf("  ✓ Copied all %d descriptors to device\n\n", batch * num_levels);
+    
+    cudaStream_t stream;
+    cudaError_t status = cudaStreamCreate(&stream);
+    if (status != cudaSuccess) {
+        fprintf(stderr, "Failed to create CUDA stream: %s\n", cudaGetErrorString(status));
+        // 在这里处理错误，例如退出程序
     }
-}
+    ms_deformable_im2col_cuda(
+              stream,
+              d_value,
+              d_spatial_shapes,
+              d_level_start_index,
+              d_sampling_loc,
+              d_attn_weight,
+              batch, spatial_size, num_heads, channels, num_levels, num_query,
+              num_points, d_tma_descs, d_output);
+    CUDA_CHECK(cudaDeviceSynchronize()); // 等待 kernel 执行完成
+    std::vector<__half> h_output(value_elements);
+    CUDA_CHECK(cudaMemcpy(h_output.data(), d_output, h_output.size() * sizeof(__half), cudaMemcpyDeviceToHost));
+    size_t count_output = std::min((size_t)100, h_output.size());
+    std::cout << "  [ ";
+    for (size_t i = 0; i < count_output; ++i) {
+        std::cout << static_cast<float>(h_output[i]) << (i == count_output - 1 ? "" : ", ");
+    }
+    std::cout << " ]\n";
 
-// Explicit instantiation
-template void ms_deformable_im2col_cuda_tma<__half>(
-    cudaStream_t stream,
-    const __half* data_value,
-    const TmaDescriptor* tma_descriptors,
-    const int64_t* data_spatial_shapes,
-    const int64_t* data_level_start_index,
-    const __half* data_sampling_loc,
-    const __half* data_attn_weight,
-    const int batch_size,
-    const int spatial_size,
-    const int num_heads,
-    const int channels,
-    const int num_levels,
-    const int num_query,
-    const int num_point,
-    __half* data_col);
+    // === 7. 释放所有 GPU 内存 ===
+    std::cout << "Freeing GPU memory..." << std::endl;
+    cudaFree(d_value);
+    cudaFree(d_spatial_shapes);
+    cudaFree(d_level_start_index);
+    cudaFree(d_sampling_loc);
+    cudaFree(d_attn_weight);
+    cudaFree(d_output);
+
+    return 0;
+}
