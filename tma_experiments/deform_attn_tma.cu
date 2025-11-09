@@ -64,7 +64,7 @@ __device__ inline void debug_print_tma_smem_comparison(
 }
 
 // TMA load helper: issue async load to specific stage buffer
-template<typename scalar_t, int CHANNELS>
+template<typename scalar_t, int CHANNELS, int MAX_WARPS>
 __device__ __forceinline__ void issue_tma_load(
     int stage_idx,
     int warp_id,
@@ -74,8 +74,8 @@ __device__ __forceinline__ void issue_tma_load(
     int hLow,
     int wLow,
     const CUtensorMap* tma_desc,
-    scalar_t smem_tile[][16][8][2][2][CHANNELS],
-    cuda::barrier<cuda::thread_scope_block> warp_bars[][16])
+    scalar_t smem_tile[][MAX_WARPS][8][2][2][CHANNELS],
+    cuda::barrier<cuda::thread_scope_block> warp_bars[][MAX_WARPS])
 {
     if (is_loader_thread and within_range) {
         // TMA coordinates: X=C, Y=W, Z=H
@@ -115,10 +115,11 @@ __device__ __forceinline__ void issue_tma_load(
 }
 
 // Wait for TMA load to complete for specific stage
+template<int MAX_WARPS>
 __device__ __forceinline__ void wait_tma_load(
     int stage_idx,
     int warp_id,
-    cuda::barrier<cuda::thread_scope_block> warp_bars[][16])
+    cuda::barrier<cuda::thread_scope_block> warp_bars[][MAX_WARPS])
 {
     __syncwarp();
     cuda::barrier<cuda::thread_scope_block>::arrival_token token = warp_bars[stage_idx][warp_id].arrive();
@@ -127,7 +128,7 @@ __device__ __forceinline__ void wait_tma_load(
 
 template <typename scalar_t=__half, const int NUM_POINT= 8, const int NUM_LEVELS=4, const int CHANNELS = 32,
                                     const int POINT_SHIFT=3, const int LEVEL_SHIFT=2, const int CHANNELS_SHIFT=5,
-                                    const int NUM_OUTPUT=8, const int NUM_OUTPUT_SHIFT=3, const int STAGES=1>
+                                    const int NUM_OUTPUT=8, const int NUM_OUTPUT_SHIFT=3, const int STAGES=2>
 __global__ void ms_deformable_im2col_gpu_kernel_template(
     const int n, const scalar_t *data_value, const int64_t *data_spatial_shapes,
     const int64_t *data_level_start_index, const scalar_t *data_sampling_loc,
@@ -166,12 +167,15 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
     const int is_loader_thread = lane_id % 4 == 0;
     // const int n_warp = blockDim.x / 32;
     // const int query_in_warp = 32 / (CHANNELS / NUM_OUTPUT);
-    __shared__ alignas(128) scalar_t smem_tile[STAGES][16][8][2][2][CHANNELS];  // max 512 threads = 16 warps, 8 queries per warp
+    // Use 256 threads (8 warps) instead of 512 (16 warps) to reduce shared memory usage
+    // This allows STAGES=2 to fit within 48KB limit
+    constexpr int MAX_WARPS = 8;  // 256 threads / 32 = 8 warps
+    __shared__ alignas(128) scalar_t smem_tile[STAGES][MAX_WARPS][8][2][2][CHANNELS];
 
     // Per-warp, per-stage barriers for multi-stage pipelining
-    // Dimensions: [STAGES][16 warps]
+    // Dimensions: [STAGES][8 warps]
     #pragma nv_diag_suppress static_var_with_dynamic_init
-    __shared__ barrier warp_bars[STAGES][16];
+    __shared__ barrier warp_bars[STAGES][MAX_WARPS];
     if (lane_id == 0) {
         #pragma unroll
         for (int s = 0; s < STAGES; s++) {
@@ -264,7 +268,7 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
       #pragma unroll
       for (int p = 0; p < STAGES - 1 && p < NUM_POINT; ++p) {
           int stage_idx = p % STAGES;
-          issue_tma_load<scalar_t, CHANNELS>(
+          issue_tma_load<scalar_t, CHANNELS, MAX_WARPS>(
               stage_idx, warp_id, query_id_in_warp,
               is_loader_thread, point_meta[p].within_range,
               point_meta[p].hLow, point_meta[p].wLow,
@@ -279,7 +283,7 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
           // Prefetch next point if available
           if (prefetch_p < NUM_POINT) {
               int prefetch_stage = prefetch_p % STAGES;
-              issue_tma_load<scalar_t, CHANNELS>(
+              issue_tma_load<scalar_t, CHANNELS, MAX_WARPS>(
                   prefetch_stage, warp_id, query_id_in_warp,
                   is_loader_thread, point_meta[prefetch_p].within_range,
                   point_meta[prefetch_p].hLow, point_meta[prefetch_p].wLow,
@@ -287,7 +291,7 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
           }
 
           // Wait for current stage's TMA to complete
-          wait_tma_load(compute_stage, warp_id, warp_bars);
+          wait_tma_load<MAX_WARPS>(compute_stage, warp_id, warp_bars);
 
           // Use metadata from point_meta array
           const auto& pm = point_meta[p_col];
@@ -393,7 +397,7 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
     }
   }
 }
-template <typename scalar_t=__half, const int THREADS_IN_ONE_BLOCK=512, const int OUTPUTS_IN_THREAD=8, const int OUTPUTS_SHIFT=3>
+template <typename scalar_t=__half, const int THREADS_IN_ONE_BLOCK=256, const int OUTPUTS_IN_THREAD=8, const int OUTPUTS_SHIFT=3>
 void ms_deformable_im2col_cuda(cudaStream_t stream, const scalar_t *data_value,
                                const int64_t *data_spatial_shapes,
                                const int64_t *data_level_start_index,
@@ -405,11 +409,32 @@ void ms_deformable_im2col_cuda(cudaStream_t stream, const scalar_t *data_value,
                                const int num_point, const CUtensorMap* d_tma_descs, scalar_t *data_col) {
   const int num_kernels = batch_size * num_query * num_heads * channels / OUTPUTS_IN_THREAD;
   const int num_actual_kernels = batch_size * num_query * num_heads * channels / OUTPUTS_IN_THREAD;
-  // 8 warp, optimal threads for MIG 
+  // 8 warps (256 threads) to fit STAGES=2 within 48KB shared memory limit
   const int num_threads = THREADS_IN_ONE_BLOCK;
   if (num_heads == 1 and num_point == 8 and num_levels == 4 and channels == 32){
-        ms_deformable_im2col_gpu_kernel_template<scalar_t, 8, 4, 32, 3, 2, 5, OUTPUTS_IN_THREAD, OUTPUTS_SHIFT>
-          <<<GET_BLOCKS(num_actual_kernels, num_threads), num_threads, 0, stream>>>(
+        // Define kernel function pointer for attribute setting
+        auto kernel = ms_deformable_im2col_gpu_kernel_template<scalar_t, 8, 4, 32, 3, 2, 5, OUTPUTS_IN_THREAD, OUTPUTS_SHIFT>;
+
+        // Request larger shared memory for multi-stage pipelining
+        // STAGES=2 requires ~65 KB, default is 48 KB, request 96 KB to be safe
+        cudaError_t attr_err = cudaFuncSetAttribute(
+            kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            96 * 1024  // 96 KB
+        );
+        if (attr_err != cudaSuccess) {
+            printf("Warning: Failed to set shared memory size: %s\n", cudaGetErrorString(attr_err));
+            printf("Continuing with default shared memory limit...\n");
+        }
+
+        // Also set preferred shared memory carveout for better performance
+        cudaFuncSetAttribute(
+            kernel,
+            cudaFuncAttributePreferredSharedMemoryCarveout,
+            cudaSharedmemCarveoutMaxShared  // Maximize shared memory vs L1 cache
+        );
+
+        kernel<<<GET_BLOCKS(num_actual_kernels, num_threads), num_threads, 0, stream>>>(
               num_kernels, data_value, data_spatial_shapes, data_level_start_index,
               data_sampling_loc, data_attn_weight, batch_size, spatial_size,
               num_query, d_tma_descs, data_col);
