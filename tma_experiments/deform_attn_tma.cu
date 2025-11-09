@@ -76,7 +76,7 @@ struct PointMeta {
 };
 
 // TMA load helper: issue async load to specific stage buffer
-template<typename scalar_t, int STAGES, int CHANNELS, int NUMBERS_OF_WARPS, int QUERIES_PER_WARP_PADDED>
+template<typename scalar_t, int STAGES, int CHANNELS, int NUMBERS_OF_WARPS, int QUERIES_PER_WARP>
 __device__ __forceinline__ void issue_tma_load(
     int stage_idx,
     int warp_id,
@@ -86,7 +86,7 @@ __device__ __forceinline__ void issue_tma_load(
     int hLow,
     int wLow,
     const CUtensorMap* tma_desc,
-    scalar_t smem_tile[STAGES][NUMBERS_OF_WARPS][QUERIES_PER_WARP_PADDED][2][2][CHANNELS],
+    scalar_t smem_tile[STAGES][NUMBERS_OF_WARPS][QUERIES_PER_WARP][2*2+1][CHANNELS],
     cuda::barrier<cuda::thread_scope_block> warp_bars[STAGES][NUMBERS_OF_WARPS])
 {
     if (is_loader_thread and within_range) {
@@ -102,7 +102,7 @@ __device__ __forceinline__ void issue_tma_load(
             " [%0], [%1, {%2, %3, %4}], [%5];\n\t"
             "}"
             :
-            : "r"(static_cast<unsigned>(__cvta_generic_to_shared(&smem_tile[stage_idx][warp_id][query_id_in_warp][0][0][0]))),
+            : "r"(static_cast<unsigned>(__cvta_generic_to_shared(&smem_tile[stage_idx][warp_id][query_id_in_warp][0][0]))),
               "l"(reinterpret_cast<uint64_t>(tma_desc)),
               "r"(tensor_coord_c), "r"(tensor_coord_w), "r"(tensor_coord_h),
               "r"(static_cast<unsigned>(__cvta_generic_to_shared(&warp_bars[stage_idx][warp_id])))
@@ -180,9 +180,10 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
     constexpr int number_of_warps = THREADS_IN_ONE_BLOCK / 32;
     constexpr int queries_per_warp = 32 / (CHANNELS / NUM_OUTPUT);
     #pragma nv_diag_suppress static_var_with_dynamic_init
-    // Padding: add 1 query slot (128 bytes) after queries_per_warp to avoid bank conflicts
-    // Each query slot: 2*2*32*2 = 128 bytes, total per warp: 8*128 + 128(pad) = 1152 bytes
-    __shared__ alignas(128) scalar_t smem_tile[STAGES][number_of_warps][queries_per_warp + 1][2][2][CHANNELS];
+    // Padding: merge [2][2] into [5] to avoid bank conflicts while maintaining alignment
+    // Original: [queries][2][2][32] = queries * 256 bytes (stride causes 8-way conflict)
+    // Now: [queries][5][32] with padding, only use indices [0-3] for [h][w] combinations
+    __shared__ alignas(128) scalar_t smem_tile[STAGES][number_of_warps][queries_per_warp][2*2+1][CHANNELS];
     __shared__ barrier warp_bars[STAGES][number_of_warps];
     if (lane_id == 0) {
         for (int s = 0; s < STAGES; s ++){
@@ -255,7 +256,7 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
                                         cur_point_meta.w_im < (scalar_t)(spatial_w + 1));
           cur_point_meta.hLow = __half2int_rd(cur_point_meta.h_im);
           cur_point_meta.wLow = __half2int_rd(cur_point_meta.w_im);
-          issue_tma_load<scalar_t, STAGES, CHANNELS, number_of_warps, queries_per_warp + 1>(
+          issue_tma_load<scalar_t, STAGES, CHANNELS, number_of_warps, queries_per_warp>(
               p, warp_id, query_id_in_warp,
               is_loader_thread, cur_point_meta.within_range,
               cur_point_meta.hLow, cur_point_meta.wLow,
@@ -283,7 +284,7 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
                                             next_point_meta.w_im < (scalar_t)(spatial_w + 1));
             next_point_meta.hLow = __half2int_rd(next_point_meta.h_im);
             next_point_meta.wLow = __half2int_rd(next_point_meta.w_im);
-            issue_tma_load<scalar_t, STAGES, CHANNELS, number_of_warps, queries_per_warp + 1>(
+            issue_tma_load<scalar_t, STAGES, CHANNELS, number_of_warps, queries_per_warp>(
                 next_stage_id, warp_id, query_id_in_warp,
                 is_loader_thread, next_point_meta.within_range,
                 next_point_meta.hLow, next_point_meta.wLow,
@@ -313,7 +314,7 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
             #pragma unroll
             for (int j = 0; j < NUM_OUTPUT; j += 8){
                 // Load from TMA shared memory for comparison
-                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[cur_stage_id][warp_id][query_id_in_warp][0][0][c_col + j]);
+                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[cur_stage_id][warp_id][query_id_in_warp][0][c_col + j]);
                 #pragma unroll
                 for (int p = 0; p < 8; p += 2){
                     HALF2(col[p]) = __hfma2(HALF2(wdataexp[0]), HALF2(vdata2d_tma[p]), HALF2(col[p]));
@@ -322,7 +323,7 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
             HALF2(wdataexp[0]) = __hmul2(half2(wdata[1],  wdata[1]), HALF2(weighthalf2));
             #pragma unroll
             for (int j = 0; j < NUM_OUTPUT; j += 8){
-                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[cur_stage_id][warp_id][query_id_in_warp][0][1][c_col + j]);
+                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[cur_stage_id][warp_id][query_id_in_warp][1][c_col + j]);
                 #pragma unroll
                 for (int p = 0; p < 8; p += 2){
                     HALF2(col[p]) = __hfma2(HALF2(wdataexp[0]), HALF2(vdata2d_tma[p]), HALF2(col[p]));
@@ -331,7 +332,7 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
             HALF2(wdataexp[0]) = __hmul2(half2(wdata[2],  wdata[2]), HALF2(weighthalf2));
             #pragma unroll
             for (int j = 0; j < NUM_OUTPUT; j += 8){
-                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[cur_stage_id][warp_id][query_id_in_warp][1][0][c_col + j]);
+                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[cur_stage_id][warp_id][query_id_in_warp][2][c_col + j]);
                 #pragma unroll
                 for (int p = 0; p < 8; p += 2){
                     HALF2(col[p]) = __hfma2(HALF2(wdataexp[0]), HALF2(vdata2d_tma[p]), HALF2(col[p]));
@@ -340,7 +341,7 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
             HALF2(wdataexp[0]) = __hmul2(half2(wdata[3],  wdata[3]), HALF2(weighthalf2));
             #pragma unroll
             for (int j = 0; j < NUM_OUTPUT; j += 8){
-                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[cur_stage_id][warp_id][query_id_in_warp][1][1][c_col + j]);
+                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[cur_stage_id][warp_id][query_id_in_warp][3][c_col + j]);
                 #pragma unroll
                 for (int p = 0; p < 8; p += 2){
                     HALF2(col[p]) = __hfma2(HALF2(wdataexp[0]), HALF2(vdata2d_tma[p]), HALF2(col[p]));
