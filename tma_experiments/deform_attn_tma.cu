@@ -20,7 +20,7 @@
 #define TILE_H 2
 #define TILE_W 2
 #define TILE_C 32
-#define THREADS_IN_ONE_BLOCK 512
+#define THREADS_IN_ONE_BLOCK 256
 #define DEBUG false
 using barrier = cuda::barrier<cuda::thread_scope_block>;
 
@@ -140,7 +140,7 @@ __device__ __forceinline__ void wait_tma_load(
 
 template <typename scalar_t=__half, const int NUM_POINT= 8, const int NUM_LEVELS=4, const int CHANNELS = 32, 
                                     const int POINT_SHIFT=3, const int LEVEL_SHIFT=2, const int CHANNELS_SHIFT=5,
-                                    const int NUM_OUTPUT=8, const int NUM_OUTPUT_SHIFT=3, const int STAGES=1>
+                                    const int NUM_OUTPUT=8, const int NUM_OUTPUT_SHIFT=3, const int STAGES=2>
 __global__ void ms_deformable_im2col_gpu_kernel_template(
     const int n, const scalar_t *data_value, const int64_t *data_spatial_shapes,
     const int64_t *data_level_start_index, const scalar_t *data_sampling_loc,
