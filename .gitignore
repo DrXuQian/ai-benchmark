@@ -46,3 +46,4 @@ tma_experiments/tma_multibatch*
 tma_experiments/tma_multiscale
 tma_experiments/tma_warp_barrier
 tma_experiments/tma_data_loading
+tma_experiments/deform_attn_*
