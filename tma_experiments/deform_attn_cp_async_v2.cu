@@ -59,17 +59,28 @@ __device__ inline void debug_print_tma_smem_comparison(
 }
 
 // Pre-compute all point coordinates and metadata before pipelining
+// For bilinear interpolation, each sampling point requires data from 4 corner points:
+//   (hLow, wLow), (hLow, wHigh), (hHigh, wLow), (hHigh, wHigh)
+// These 4 points form a 2x2 spatial tile that will be loaded via cp.async
 template <typename scalar_t>
 struct PointMeta {
-    half2 loc;
-    scalar_t weight;
-    half2 weighthalf2;
-    scalar_t h_im, w_im;
-    int within_range;
-    int32_t hLow, wLow, hHigh, wHigh;
+    half2 loc;           // Normalized sampling location (w, h) in [0, 1]
+    scalar_t weight;     // Attention weight for this sampling point
+    half2 weighthalf2;   // Attention weight replicated for half2 operations
+    scalar_t h_im, w_im; // Actual coordinates in feature map (floating point)
+    int within_range;    // Whether the sampling point is within valid bounds
+    int32_t hLow, wLow, hHigh, wHigh;  // Four corner coordinates for bilinear interpolation
 };
 
-// cp.async load helper: issue async load to specific stage buffer using real cp.async API
+// cp.async load helper: issue async load for 2x2 spatial tile (4 corner points)
+// Each of the 32 threads in a warp loads 4 fp16 values (8 bytes) from one of the 4 corners
+// Thread layout maps to 4 corners × 8 channel groups:
+//   spatial_offset = lane_id & 0x3 determines which of 4 corners:
+//     0 → (hLow, wLow)   - top-left
+//     1 → (hLow, wHigh)  - top-right
+//     2 → (hHigh, wLow)  - bottom-left
+//     3 → (hHigh, wHigh) - bottom-right
+//   c_offset = (lane_id >> 2) * 4 determines which 4 channels out of 32
 template<typename scalar_t, int STAGES, int CHANNELS, int NUMBERS_OF_WARPS, int QUERIES_PER_WARP>
 __device__ __forceinline__ void issue_cp_async_load(
     int stage_idx,
@@ -90,13 +101,13 @@ __device__ __forceinline__ void issue_cp_async_load(
         const int wStride = CHANNELS;
 
         // Each thread loads part of the tile
-        const int c_offset = (lane_id >> 2) * 4;
-        const int spatial_offset = lane_id & 0x3;
-        const int h_offset = spatial_offset >> 1;
-        const int w_offset = spatial_offset & 0x1;
+        const int c_offset = (lane_id >> 2) * 4;           // Which 4 channels: 0,4,8,...,28
+        const int spatial_offset = lane_id & 0x3;          // Which corner: 0,1,2,3
+        const int h_offset = spatial_offset >> 1;          // 0,0,1,1 → row offset
+        const int w_offset = spatial_offset & 0x1;         // 0,1,0,1 → col offset
 
-        const int h_actual = hLow + h_offset;
-        const int w_actual = wLow + w_offset;
+        const int h_actual = hLow + h_offset;              // hLow or hHigh
+        const int w_actual = wLow + w_offset;              // wLow or wHigh
 
         if (h_actual >= 0 && h_actual < spatial_h && w_actual >= 0 && w_actual < spatial_w) {
             const scalar_t* src = data_value_ptr + h_actual * hStride + w_actual * wStride + c_offset;
@@ -225,8 +236,11 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
                                         cur_point_meta.w_im > (scalar_t)(0) &&
                                         cur_point_meta.h_im < (scalar_t)(spatial_h + 1) &&
                                         cur_point_meta.w_im < (scalar_t)(spatial_w + 1));
+          // Compute four corner coordinates for bilinear interpolation
           cur_point_meta.hLow = __half2int_rd(cur_point_meta.h_im);
           cur_point_meta.wLow = __half2int_rd(cur_point_meta.w_im);
+          cur_point_meta.hHigh = cur_point_meta.hLow + 1;
+          cur_point_meta.wHigh = cur_point_meta.wLow + 1;
           issue_cp_async_load<scalar_t, STAGES, CHANNELS, number_of_warps, queries_per_warp>(
               p, warp_id, query_id_in_warp, lane_id,
               cur_point_meta.within_range,
@@ -254,8 +268,11 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
                                             next_point_meta.w_im > (scalar_t)(0) &&
                                             next_point_meta.h_im < (scalar_t)(spatial_h + 1) &&
                                             next_point_meta.w_im < (scalar_t)(spatial_w + 1));
+            // Compute four corner coordinates for bilinear interpolation
             next_point_meta.hLow = __half2int_rd(next_point_meta.h_im);
             next_point_meta.wLow = __half2int_rd(next_point_meta.w_im);
+            next_point_meta.hHigh = next_point_meta.hLow + 1;
+            next_point_meta.wHigh = next_point_meta.wLow + 1;
             issue_cp_async_load<scalar_t, STAGES, CHANNELS, number_of_warps, queries_per_warp>(
                 next_stage_id, warp_id, query_id_in_warp, lane_id,
                 next_point_meta.within_range,
