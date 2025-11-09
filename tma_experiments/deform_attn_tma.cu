@@ -64,6 +64,80 @@ __device__ inline void debug_print_tma_smem_comparison(
     }
 }
 
+// Pre-compute all point coordinates and metadata before pipelining
+template <typename scalar_t>
+struct PointMeta {
+    half2 loc;
+    scalar_t weight;
+    half2 weighthalf2;
+    scalar_t h_im, w_im;
+    int within_range;
+    int32_t hLow, wLow, hHigh, wHigh;
+};
+
+// TMA load helper: issue async load to specific stage buffer
+template<typename scalar_t, int STAGES, int CHANNELS, int NUMBERS_OF_WARPS, int QUERIES_PER_WARP>
+__device__ __forceinline__ void issue_tma_load(
+    int stage_idx,
+    int warp_id,
+    int query_id_in_warp,
+    int is_loader_thread,
+    int within_range,
+    int hLow,
+    int wLow,
+    const CUtensorMap* tma_desc,
+    scalar_t smem_tile[STAGES][NUMBERS_OF_WARPS][QUERIES_PER_WARP][2][2][CHANNELS],
+    cuda::barrier<cuda::thread_scope_block> warp_bars[STAGES][NUMBERS_OF_WARPS])
+{
+    if (is_loader_thread and within_range) {
+        // TMA coordinates: X=C, Y=W, Z=H
+        int32_t tensor_coord_c = 0;
+        int32_t tensor_coord_w = wLow;
+        int32_t tensor_coord_h = hLow;
+
+        // Issue TMA load to the specified stage
+        asm volatile(
+            "{\n\t"
+            "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
+            " [%0], [%1, {%2, %3, %4}], [%5];\n\t"
+            "}"
+            :
+            : "r"(static_cast<unsigned>(__cvta_generic_to_shared(&smem_tile[stage_idx][warp_id][query_id_in_warp][0][0][0]))),
+              "l"(reinterpret_cast<uint64_t>(tma_desc)),
+              "r"(tensor_coord_c), "r"(tensor_coord_w), "r"(tensor_coord_h),
+              "r"(static_cast<unsigned>(__cvta_generic_to_shared(&warp_bars[stage_idx][warp_id])))
+            : "memory"
+        );
+
+        asm volatile(
+            "mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;\n\t"
+            :
+            : "r"(static_cast<unsigned>(__cvta_generic_to_shared(&warp_bars[stage_idx][warp_id]))),
+              "n"(2 * 2 * CHANNELS * sizeof(scalar_t))
+        );
+    } else {
+        // Out of bounds - expect 0 bytes
+        asm volatile(
+            "mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;\n\t"
+            :
+            : "r"(static_cast<unsigned>(__cvta_generic_to_shared(&warp_bars[stage_idx][warp_id]))),
+              "n"(0)
+        );
+    }
+}
+
+// Wait for TMA load to complete for specific stage
+template<int STAGES, int NUMBERS_OF_WARPS>
+__device__ __forceinline__ void wait_tma_load(
+    int stage_idx,
+    int warp_id,
+    cuda::barrier<cuda::thread_scope_block> warp_bars[STAGES][NUMBERS_OF_WARPS])
+{
+    __syncwarp();
+    cuda::barrier<cuda::thread_scope_block>::arrival_token token = warp_bars[stage_idx][warp_id].arrive();
+    warp_bars[stage_idx][warp_id].wait(std::move(token));
+}
+
 template <typename scalar_t=__half, const int NUM_POINT= 8, const int NUM_LEVELS=4, const int CHANNELS = 32, 
                                     const int POINT_SHIFT=3, const int LEVEL_SHIFT=2, const int CHANNELS_SHIFT=5,
                                     const int NUM_OUTPUT=8, const int NUM_OUTPUT_SHIFT=3, const int STAGES=1>
@@ -81,7 +155,6 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
     const int b_col = (float)_temp/(float)num_query;
     const __half kZERO = __int2half_rz(0);
     const __half kONE = __int2half_rz(1);
-    int32_t const wStride = CHANNELS; // 256 
 
     scalar_t *data_col_ptr = data_col + (index << NUM_OUTPUT_SHIFT);
     int data_weight_ptr = sampling_index << (LEVEL_SHIFT + POINT_SHIFT); // * NUM_LEVELS * NUM_POINT;
@@ -103,17 +176,16 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
     const int warp_id = tid / 32;
     const int query_id_in_warp = lane_id >> 2;
     const int is_loader_thread = lane_id % 4 == 0;
-    // const int n_warp = blockDim.x / 32;
-    // const int query_in_warp = 32 / (CHANNELS / NUM_OUTPUT);
 
-    // Per-warp barriers - FIXED: 16 barriers for 16 warps (was 8, causing out-of-bounds access!)
     constexpr int number_of_warps = THREADS_IN_ONE_BLOCK / 32;
     constexpr int queries_per_warp = 32 / (CHANNELS / NUM_OUTPUT);
     #pragma nv_diag_suppress static_var_with_dynamic_init
     __shared__ alignas(128) scalar_t smem_tile[STAGES][number_of_warps][queries_per_warp][2][2][CHANNELS];  // max 512 threads = 16 warps, 8 queries per warp
-    __shared__ barrier warp_bars[number_of_warps];
+    __shared__ barrier warp_bars[STAGES][number_of_warps];
     if (lane_id == 0) {
-        init(&warp_bars[warp_id], 32);
+        for (int s = 0; s < STAGES; s ++){
+            init(&warp_bars[s][warp_id], 32);
+        }
         asm volatile("fence.proxy.async.shared::cta;");
     }
 
@@ -140,7 +212,6 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
       const int spatial_h_ptr = l_col << 1;
       const int spatial_h = data_spatial_shapes[spatial_h_ptr];
       const int spatial_w = data_spatial_shapes[spatial_h_ptr + 1];
-      int32_t const hStride = (spatial_w + 2) << CHANNELS_SHIFT;
       // h -> hight , w -> low 
       const half2 spatail_hw = half2(spatial_w, spatial_h);
 
@@ -163,76 +234,71 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
       }
       data_loc_w_ptr += (NUM_POINT << 1);
       data_weight_ptr += NUM_POINT;
+
+      PointMeta<scalar_t> point_meta[STAGES];
+
+      // initialization of point_meta for first STAGES-1 points
+      #pragma unroll
+      for (int p = 0; p < STAGES - 1; ++p) {
+          auto& cur_point_meta = point_meta[p];
+          cur_point_meta.loc = loc_hw_vec[p];
+          cur_point_meta.weight = weight_vec[p];
+          cur_point_meta.weighthalf2 = half2(weight_vec[p], weight_vec[p]);
+          half2 hw_im = __hfma2(cur_point_meta.loc, spatail_hw, zp5);
+          cur_point_meta.h_im = __high2half(hw_im);
+          cur_point_meta.w_im = __low2half(hw_im);
+          cur_point_meta.within_range = (cur_point_meta.h_im > (scalar_t)(0) &&
+                                        cur_point_meta.w_im > (scalar_t)(0) &&
+                                        cur_point_meta.h_im < (scalar_t)(spatial_h + 1) &&
+                                        cur_point_meta.w_im < (scalar_t)(spatial_w + 1));
+          cur_point_meta.hLow = __half2int_rd(cur_point_meta.h_im);
+          cur_point_meta.wLow = __half2int_rd(cur_point_meta.w_im);
+          issue_tma_load<scalar_t, STAGES, CHANNELS, number_of_warps, queries_per_warp>(
+              p, warp_id, query_id_in_warp,
+              is_loader_thread, cur_point_meta.within_range,
+              cur_point_meta.hLow, cur_point_meta.wLow,
+              &d_tma_descs[b_col * NUM_LEVELS + l_col],
+              smem_tile, warp_bars);
+      }
+
       #pragma unroll
       for (int p_col = 0; p_col < NUM_POINT; ++p_col) {
-        const half2 loc = loc_hw_vec[p_col];
-        const scalar_t weight = weight_vec[p_col];
-        half2 weighthalf2 = half2(weight, weight);
-        half2 hw_im = __hfma2(loc, spatail_hw, zp5);
-        scalar_t h_im = __high2half(hw_im);
-        scalar_t w_im = __low2half(hw_im);
-
-        const int within_range = (h_im > (scalar_t)(0) && 
-                                  w_im > (scalar_t)(0) && 
-                                  h_im < (scalar_t)(spatial_h + 1) && 
-                                  w_im < (scalar_t)(spatial_w + 1));
-        int32_t const hLow = __half2int_rd(h_im);
-        int32_t const wLow = __half2int_rd(w_im);
-        int32_t const hHigh = hLow + 1;
-        int32_t const wHigh = wLow + 1;
-
-        if (is_loader_thread and within_range) {
-            // TMA coordinates: X=C, Y=W, Z=H
-            int32_t tensor_coord_c = 0;
-            int32_t tensor_coord_w = wLow;
-            int32_t tensor_coord_h = hLow;
-
-            // Select correct TMA descriptor for this batch and level
-            // Index: batch * NUM_LEVELS + level
-            const int desc_idx = b_col * NUM_LEVELS + l_col;
-            const CUtensorMap* tma_desc = &d_tma_descs[desc_idx];
-
-            // Issue TMA load for this level
-            asm volatile(
-                "{\n\t"
-                "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
-                " [%0], [%1, {%2, %3, %4}], [%5];\n\t"
-                "}"
-                :
-                : "r"(static_cast<unsigned>(__cvta_generic_to_shared(&smem_tile[0][warp_id][query_id_in_warp][0][0][0]))),
-                "l"(reinterpret_cast<uint64_t>(tma_desc)),
-                "r"(tensor_coord_c), "r"(tensor_coord_w), "r"(tensor_coord_h),
-                "r"(static_cast<unsigned>(__cvta_generic_to_shared(&warp_bars[warp_id])))
-                : "memory"
-            );
-
-            asm volatile(
-                "mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;\n\t"
-                :
-                : "r"(static_cast<unsigned>(__cvta_generic_to_shared(&warp_bars[warp_id]))),
-                    "n"(2 * 2 * 32 * sizeof(scalar_t))
-            );
-        }else {
-            asm volatile(
-                "mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;\n\t"
-                :
-                : "r"(static_cast<unsigned>(__cvta_generic_to_shared(&warp_bars[warp_id]))),
-                    "n"(0)
-            );
+        int cur_stage_id = p_col % STAGES;
+        auto& cur_point_meta = point_meta[cur_stage_id];
+        if (p_col + STAGES - 1 < NUM_POINT) {
+            int next_p = p_col + STAGES - 1;
+            int next_stage_id = next_p % STAGES;
+            auto& next_point_meta = point_meta[next_stage_id];
+            next_point_meta.loc = loc_hw_vec[next_p];
+            next_point_meta.weight = weight_vec[next_p];
+            next_point_meta.weighthalf2 = half2(weight_vec[next_p], weight_vec[next_p]);
+            half2 hw_im = __hfma2(next_point_meta.loc, spatail_hw, zp5);
+            next_point_meta.h_im = __high2half(hw_im);
+            next_point_meta.w_im = __low2half(hw_im);
+            next_point_meta.within_range = (next_point_meta.h_im > (scalar_t)(0) &&
+                                            next_point_meta.w_im > (scalar_t)(0) &&
+                                            next_point_meta.h_im < (scalar_t)(spatial_h + 1) &&
+                                            next_point_meta.w_im < (scalar_t)(spatial_w + 1));
+            next_point_meta.hLow = __half2int_rd(next_point_meta.h_im);
+            next_point_meta.wLow = __half2int_rd(next_point_meta.w_im);
+            issue_tma_load<scalar_t, STAGES, CHANNELS, number_of_warps, queries_per_warp>(
+                next_stage_id, warp_id, query_id_in_warp,
+                is_loader_thread, next_point_meta.within_range,
+                next_point_meta.hLow, next_point_meta.wLow,
+                &d_tma_descs[b_col * NUM_LEVELS + l_col],
+                smem_tile, warp_bars);
         }
-        __syncwarp();
-        // Warp waits for this level's TMA to complete
-        barrier::arrival_token token = warp_bars[warp_id].arrive();
-        warp_bars[warp_id].wait(std::move(token));
+        wait_tma_load<STAGES, number_of_warps>(cur_stage_id, warp_id, warp_bars);
 
-        if (within_range){
+        if (cur_point_meta.within_range) {
+            int hLow = cur_point_meta.hLow;
+            int wLow = cur_point_meta.wLow;
+            const scalar_t h_im = cur_point_meta.h_im;
+            const scalar_t w_im = cur_point_meta.w_im;
+            half2 weighthalf2 = cur_point_meta.weighthalf2;
             const __half lh = __hsub(h_im, __int2half_rd(hLow));
             const __half lw = __hsub(w_im, __int2half_rd(wLow));
             const __half hh = __hsub(kONE, lh), hw = __hsub(kONE, lw);
-            int32_t const hLowPtrOffset = hLow * hStride;
-            int32_t const hHighPtrOffset = hLowPtrOffset + hStride;
-            int32_t const wLowPtrOffset = wLow << CHANNELS_SHIFT;
-            int32_t const wHighPtrOffset = wLowPtrOffset + wStride;
             __half pst_lh[4] = {hh, hh, lh, lh};
             __half pst_rh[4] = {hw, lw, hw, lw};
             __half wdata[4] ;
@@ -240,66 +306,39 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
             HALF2(wdata[2]) = __hmul2(HALF2(pst_lh[2]), HALF2(pst_rh[2]));
             // // expand wdata from [w0, w1, w2, w3] to  [w0, w0, w1, w1, w2, w2, ..., w3, w3]
             __half wdataexp[2];
-            __half vdata2d[NUM_OUTPUT] ;
             __half vdata2d_tma[NUM_OUTPUT];  // For TMA loaded data comparison
-            int32_t const ptr1 = hLowPtrOffset + wLowPtrOffset + c_col;
             HALF2(wdataexp[0]) = __hmul2(half2(wdata[0],  wdata[0]), HALF2(weighthalf2));
             #pragma unroll
             for (int j = 0; j < NUM_OUTPUT; j += 8){
                 // Load from TMA shared memory for comparison
-                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[0][warp_id][query_id_in_warp][0][0][c_col + j]);
-                // Debug: Compare TMA vs global memory for ptr1 (h=hLow, w=wLow)
-                if (DEBUG) {
-                    // Load from global memory (current implementation)
-                    LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(data_value_ptr)[ptr1 + j]);
-                    debug_print_tma_smem_comparison(tid, b_col, l_col, p_col, blockIdx.x,
-                                                     vdata2d, vdata2d_tma, 1, hLow, wLow, c_col, NUM_OUTPUT);
-                }
+                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[cur_stage_id][warp_id][query_id_in_warp][0][0][c_col + j]);
                 #pragma unroll
                 for (int p = 0; p < 8; p += 2){
                     HALF2(col[p]) = __hfma2(HALF2(wdataexp[0]), HALF2(vdata2d_tma[p]), HALF2(col[p]));
                 }
             }
             HALF2(wdataexp[0]) = __hmul2(half2(wdata[1],  wdata[1]), HALF2(weighthalf2));
-            int32_t const ptr2 = hLowPtrOffset + wHighPtrOffset + c_col;
             #pragma unroll
             for (int j = 0; j < NUM_OUTPUT; j += 8){
-                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[0][warp_id][query_id_in_warp][0][1][c_col + j]);
-                if (DEBUG) {
-                    LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(data_value_ptr)[ptr2 + j]);
-                    debug_print_tma_smem_comparison(tid, b_col, l_col, p_col, blockIdx.x,
-                                                     vdata2d, vdata2d_tma, 2, hLow, wHigh, c_col, NUM_OUTPUT);
-                }
+                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[cur_stage_id][warp_id][query_id_in_warp][0][1][c_col + j]);
                 #pragma unroll
                 for (int p = 0; p < 8; p += 2){
                     HALF2(col[p]) = __hfma2(HALF2(wdataexp[0]), HALF2(vdata2d_tma[p]), HALF2(col[p]));
                 }
             }
-            int32_t const ptr3 = hHighPtrOffset + wLowPtrOffset + c_col;
             HALF2(wdataexp[0]) = __hmul2(half2(wdata[2],  wdata[2]), HALF2(weighthalf2));
             #pragma unroll
             for (int j = 0; j < NUM_OUTPUT; j += 8){
-                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[0][warp_id][query_id_in_warp][1][0][c_col + j]);
-                if (DEBUG) {
-                    LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(data_value_ptr)[ptr3 + j]);
-                    debug_print_tma_smem_comparison(tid, b_col, l_col, p_col, blockIdx.x,
-                                                     vdata2d, vdata2d_tma, 3, hHigh, wLow, c_col, NUM_OUTPUT);
-                }
+                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[cur_stage_id][warp_id][query_id_in_warp][1][0][c_col + j]);
                 #pragma unroll
                 for (int p = 0; p < 8; p += 2){
                     HALF2(col[p]) = __hfma2(HALF2(wdataexp[0]), HALF2(vdata2d_tma[p]), HALF2(col[p]));
                 }
             }
-            int32_t const ptr4 = hHighPtrOffset + wHighPtrOffset + c_col;
             HALF2(wdataexp[0]) = __hmul2(half2(wdata[3],  wdata[3]), HALF2(weighthalf2));
             #pragma unroll
             for (int j = 0; j < NUM_OUTPUT; j += 8){
-                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[0][warp_id][query_id_in_warp][1][1][c_col + j]);
-                if (DEBUG) {
-                    LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(data_value_ptr)[ptr4 + j]);
-                    debug_print_tma_smem_comparison(tid, b_col, l_col, p_col, blockIdx.x,
-                                                     vdata2d, vdata2d_tma, 4, hHigh, wHigh, c_col, NUM_OUTPUT);
-                }
+                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[cur_stage_id][warp_id][query_id_in_warp][1][1][c_col + j]);
                 #pragma unroll
                 for (int p = 0; p < 8; p += 2){
                     HALF2(col[p]) = __hfma2(HALF2(wdataexp[0]), HALF2(vdata2d_tma[p]), HALF2(col[p]));
