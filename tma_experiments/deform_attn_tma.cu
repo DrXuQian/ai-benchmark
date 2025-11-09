@@ -243,14 +243,13 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
             HALF2(wdataexp[0]) = __hmul2(half2(wdata[0],  wdata[0]), HALF2(weighthalf2));
             #pragma unroll
             for (int j = 0; j < NUM_OUTPUT; j += 8){
-                // Load from global memory (current implementation)
-                LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(data_value_ptr)[ptr1 + j]);
-
                 // Load from TMA shared memory for comparison
                 LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[0][warp_id][query_id_in_warp][0][0][c_col + j]);
 
                 // Debug: Compare TMA vs global memory for ptr1 (h=hLow, w=wLow)
                 if (DEBUG) {
+                    // Load from global memory (current implementation)
+                    LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(data_value_ptr)[ptr1 + j]);
                     debug_print_tma_smem_comparison(tid, b_col, l_col, p_col, blockIdx.x,
                                                      vdata2d, vdata2d_tma, 1, hLow, wLow, c_col, NUM_OUTPUT);
                 }
@@ -264,9 +263,9 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
             int32_t const ptr2 = hLowPtrOffset + wHighPtrOffset + c_col;
             #pragma unroll
             for (int j = 0; j < NUM_OUTPUT; j += 8){
-                LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(data_value_ptr)[ptr2 + j]);
                 LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[0][warp_id][query_id_in_warp][0][1][c_col + j]);
                 if (DEBUG) {
+                    LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(data_value_ptr)[ptr2 + j]);
                     debug_print_tma_smem_comparison(tid, b_col, l_col, p_col, blockIdx.x,
                                                      vdata2d, vdata2d_tma, 2, hLow, wHigh, c_col, NUM_OUTPUT);
                 }
@@ -279,9 +278,9 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
             HALF2(wdataexp[0]) = __hmul2(half2(wdata[2],  wdata[2]), HALF2(weighthalf2));
             #pragma unroll
             for (int j = 0; j < NUM_OUTPUT; j += 8){
-                LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(data_value_ptr)[ptr3 + j]);
                 LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[0][warp_id][query_id_in_warp][1][0][c_col + j]);
                 if (DEBUG) {
+                    LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(data_value_ptr)[ptr3 + j]);
                     debug_print_tma_smem_comparison(tid, b_col, l_col, p_col, blockIdx.x,
                                                      vdata2d, vdata2d_tma, 3, hHigh, wLow, c_col, NUM_OUTPUT);
                 }
@@ -294,9 +293,9 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
             HALF2(wdataexp[0]) = __hmul2(half2(wdata[3],  wdata[3]), HALF2(weighthalf2));
             #pragma unroll
             for (int j = 0; j < NUM_OUTPUT; j += 8){
-                LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(data_value_ptr)[ptr4 + j]);
                 LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[0][warp_id][query_id_in_warp][1][1][c_col + j]);
                 if (DEBUG) {
+                    LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(data_value_ptr)[ptr4 + j]);
                     debug_print_tma_smem_comparison(tid, b_col, l_col, p_col, blockIdx.x,
                                                      vdata2d, vdata2d_tma, 4, hHigh, wHigh, c_col, NUM_OUTPUT);
                 }
