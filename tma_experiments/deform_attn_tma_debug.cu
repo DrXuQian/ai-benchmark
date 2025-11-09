@@ -50,11 +50,6 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
     const int spatial_size, const int num_query,
     const CUtensorMap* d_tma_descs, scalar_t *data_col) {
     CUDA_1D_KERNEL_LOOP(index, n) {
-    // DEBUG
-    // if (threadIdx.x == 0 && blockIdx.x == 0) {
-    //     printf("!!! KERNEL LOOP ENTERED !!! index=%d, n=%d\n", index, n);
-    // }
-
     int _temp = index << NUM_OUTPUT_SHIFT;
     const int c_col = _temp & (CHANNELS -1 ); //_temp % CHANNELS;
     _temp = (_temp >> CHANNELS_SHIFT);
@@ -88,28 +83,13 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
     const int query_in_warp = 32 / (CHANNELS / NUM_OUTPUT);
     __shared__ alignas(128) scalar_t smem_tile[STAGES][16][8][2][2][32];  // max 512 threads = 16 warps, 8 queries per warp
 
-    // Per-warp barriers - FIXED: 16 barriers for 16 warps (was 8, causing out-of-bounds access!)
+    // Per-warp barriers
     #pragma nv_diag_suppress static_var_with_dynamic_init
-    __shared__ barrier warp_bars[16];
+    __shared__ barrier warp_bars[8];
     if (lane_id == 0) {
         init(&warp_bars[warp_id], 32);
         asm volatile("fence.proxy.async.shared::cta;");
     }
-
-    // Initialize smem to known pattern for debugging (99.99)
-    for (int i = tid; i < 16 * 8 * 2 * 2 * 32; i += blockDim.x) {
-        ((scalar_t*)smem_tile)[i] = __float2half(99.99f);
-    }
-    __syncthreads();
-
-    // DEBUG: Check smem after initialization - only once
-    // if (tid == 0 && blockIdx.x == 0) {
-    //     printf("\n[SMEM_INIT] After init [0][0][0][0][0][0-7]: ");
-    //     for (int c = 0; c < 8; c++)
-    //         printf("%.2f ", __half2float(smem_tile[0][0][0][0][0][c]));
-    //     printf("\n");
-    // }
-    __syncthreads();
     __syncwarp();
     // Prefetch TMA descriptors for this batch's 4 levels into L2 cache
     // This reduces descriptor access latency during TMA operations
@@ -158,12 +138,7 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
       data_weight_ptr += NUM_POINT;
       #pragma unroll
       for (int p_col = 0; p_col < NUM_POINT; ++p_col) {
-        // TESTING: Use fixed normalized coordinates instead of reading from sampling_locations
-        // Original: const half2 loc = loc_hw_vec[p_col];
-        const half2 loc = (tid == 0 && blockIdx.x == 0 && b_col == 0 && l_col == 0 && p_col == 0)
-                          ? half2(0.0f, 0.0f)  // Use (0, 0) for first point in first block
-                          : loc_hw_vec[p_col];
-
+        const half2 loc = loc_hw_vec[p_col]; 
         const scalar_t weight = weight_vec[p_col];
         half2 weighthalf2 = half2(weight, weight);
         half2 hw_im = __hfma2(loc, spatail_hw, zp5);
@@ -191,12 +166,11 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
             const CUtensorMap* tma_desc = &d_tma_descs[desc_idx];
 
             // Debug: Print TMA load info for thread 0, batch 0 only
-            if (tid == 0 && b_col == 0 && l_col == 0 && p_col == 0 && blockIdx.x == 0) {
+            if (tid == 0 && b_col == 0 && l_col == 0 && p_col == 0) {
                 printf("TMA Load Info (thread %d, loader=%d):\n", tid, is_loader_thread);
                 printf("  desc_idx=%d (batch=%d, level=%d)\n", desc_idx, b_col, l_col);
                 printf("  TMA coords: (C=%d, W=%d, H=%d)\n", tensor_coord_c, tensor_coord_w, tensor_coord_h);
                 printf("  smem dest: smem_tile[0][%d][%d][0][0][0]\n", warp_id, query_id_in_warp);
-                printf("  spatial_h=%d, spatial_w=%d\n", spatial_h, spatial_w);
             }
 
             // Issue TMA load for this level
@@ -221,14 +195,6 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
             );
         }else {
             // Out of bounds - expect 0 bytes
-            if (tid == 0 && b_col == 0 && l_col == 0 && p_col == 0 && blockIdx.x == 0) {
-                printf("NOT loading TMA: is_loader=%d, within_range=%d\n", is_loader_thread, within_range);
-                printf("  loc (from sampling_loc): h=%.4f, w=%.4f\n", __half2float(__high2half(loc)), __half2float(__low2half(loc)));
-                printf("  spatial_hw: h=%.4f, w=%.4f\n", __half2float(__high2half(spatail_hw)), __half2float(__low2half(spatail_hw)));
-                printf("  h_im=%.4f, w_im=%.4f\n", __half2float(h_im), __half2float(w_im));
-                printf("  hLow=%d, wLow=%d\n", hLow, wLow);
-                printf("  spatial_h=%d, spatial_w=%d\n", spatial_h, spatial_w);
-            }
             asm volatile(
                 "mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;\n\t"
                 :
@@ -240,38 +206,6 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
         // Warp waits for this level's TMA to complete
         barrier::arrival_token token = warp_bars[warp_id].arrive();
         warp_bars[warp_id].wait(std::move(token));
-
-        // DEBUG: Check TMA descriptor base address
-        if (tid == 0 && b_col == 0 && l_col == 0 && p_col == 0 && blockIdx.x == 0) {
-            const CUtensorMap* tma_desc = &d_tma_descs[b_col * NUM_LEVELS + l_col];
-            const uint64_t* desc_u64 = reinterpret_cast<const uint64_t*>(tma_desc);
-            uint64_t base_addr_u64 = desc_u64[0];
-            const scalar_t* tma_base_addr = reinterpret_cast<const scalar_t*>(base_addr_u64);
-
-            printf("\n[TMA DESC CHECK] batch=%d, level=%d\n", b_col, l_col);
-            printf("  TMA desc base_addr: %p\n", tma_base_addr);
-            printf("  data_value_ptr:     %p\n", data_value_ptr);
-            printf("  Offset: %ld FP16 elements\n",
-                   ((long)tma_base_addr - (long)data_value_ptr) / sizeof(scalar_t));
-
-            printf("[SMEM_AFTER_TMA] After TMA wait:\n");
-            printf("  [0][0][0][0][0][0-7]: ");
-            for (int c = 0; c < 32; c++)
-                printf("%.2f ", __half2float(smem_tile[0][warp_id][query_id_in_warp][0][0][c]));
-            printf("\n");
-            printf("  [0][0][0][0][1][0-7]: ");
-            for (int c = 0; c < 32; c++)
-                printf("%.2f ", __half2float(smem_tile[0][warp_id][query_id_in_warp][0][1][c]));
-            printf("\n");
-            printf("  [0][0][0][1][0][0-7]: ");
-            for (int c = 0; c < 32; c++)
-                printf("%.2f ", __half2float(smem_tile[0][warp_id][query_id_in_warp][1][0][c]));
-            printf("\n");
-            printf("  [0][0][0][1][1][0-7]: ");
-            for (int c = 0; c < 32; c++)
-                printf("%.2f ", __half2float(smem_tile[0][warp_id][query_id_in_warp][1][1][c]));
-            printf("\n");
-        }
 
         if (within_range){
             const __half lh = __hsub(h_im, __int2half_rd(hLow));
@@ -298,16 +232,12 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
                 LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(data_value_ptr)[ptr1 + j]);
 
                 // Load from TMA shared memory for comparison
-                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[0][warp_id][query_id_in_warp][0][0][c_col + j]);
+                scalar_t* tma_ptr = &smem_tile[0][warp_id][query_id_in_warp][0][0][c_col + j];
+                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(tma_ptr);
 
                 // Debug print for threadIdx.x == 0, batch 0, level 0, point 0 only
-                if (tid == 0 && b_col == 0 && l_col == 0 && p_col == 0 && j == 0 && within_range && blockIdx.x == 0) {
-                    printf("\n=== Thread0 Debug [batch=%d, level=%d, point=%d, c_col=%d] ===\n", b_col, l_col, p_col, c_col);
-                    printf("data_value_ptr[0-7]: [%.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f]\n",
-                           __half2float(data_value_ptr[0]), __half2float(data_value_ptr[1]),
-                           __half2float(data_value_ptr[2]), __half2float(data_value_ptr[3]),
-                           __half2float(data_value_ptr[4]), __half2float(data_value_ptr[5]),
-                           __half2float(data_value_ptr[6]), __half2float(data_value_ptr[7]));
+                if (tid == 0 && b_col == 0 && l_col == 0 && p_col == 0 && j == 0 && within_range) {
+                    printf("\n=== Thread0 Debug [batch=%d, level=%d, point=%d] ===\n", b_col, l_col, p_col);
                     printf("Global memory load: [%.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f]\n",
                            __half2float(vdata2d[0]), __half2float(vdata2d[1]),
                            __half2float(vdata2d[2]), __half2float(vdata2d[3]),
@@ -565,19 +495,14 @@ int main(int argc, char* argv[]) {
             // Create TMA descriptor for this batch×level combination
             uint64_t globalDim[3] = {(uint64_t)channels, (uint64_t)(w + 2), (uint64_t)(h + 2)};
             uint64_t globalStrides[2] = {
-                channels * sizeof(half),
-                (w + 2) * channels * sizeof(half)
+                channels * sizeof(half),              // stride[0]: skip to next W
+                (w + 2) * channels * sizeof(half)   // stride[1]: skip to next H
             };
             uint32_t boxDim[3] = {TILE_C, TILE_W, TILE_H};
             uint32_t elementStrides[3] = {1, 1, 1};
+            printf("Creating TMA desc: batch=%d, level=%d, h=%d, w=%d\n", b, l, h, w);
+            fflush(stdout);
             auto _value = value_of_batch + h_level_start_index[l] * channels;
-
-            if (b == 0) {
-                size_t offset_bytes = ((char*)_value - (char*)d_value);
-                printf("  Level %d: offset=%zu bytes, alignment=%zu\n",
-                       l, offset_bytes, offset_bytes % 128);
-            }
-
             CUresult res = cuTensorMapEncodeTiled_func(
                 &h_tma_descs[b][l],
                 CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
