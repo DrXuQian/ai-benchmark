@@ -20,6 +20,7 @@
 #define TILE_H 2
 #define TILE_W 2
 #define TILE_C 32
+#define THREADS_IN_ONE_BLOCK 512
 #define DEBUG false
 using barrier = cuda::barrier<cuda::thread_scope_block>;
 
@@ -104,11 +105,13 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
     const int is_loader_thread = lane_id % 4 == 0;
     // const int n_warp = blockDim.x / 32;
     // const int query_in_warp = 32 / (CHANNELS / NUM_OUTPUT);
-    __shared__ alignas(128) scalar_t smem_tile[STAGES][16][8][2][2][CHANNELS];  // max 512 threads = 16 warps, 8 queries per warp
 
     // Per-warp barriers - FIXED: 16 barriers for 16 warps (was 8, causing out-of-bounds access!)
+    constexpr int number_of_warps = THREADS_IN_ONE_BLOCK / 32;
+    constexpr int queries_per_warp = 32 / (CHANNELS / NUM_OUTPUT);
     #pragma nv_diag_suppress static_var_with_dynamic_init
-    __shared__ barrier warp_bars[16];
+    __shared__ alignas(128) scalar_t smem_tile[STAGES][number_of_warps][queries_per_warp][2][2][CHANNELS];  // max 512 threads = 16 warps, 8 queries per warp
+    __shared__ barrier warp_bars[number_of_warps];
     if (lane_id == 0) {
         init(&warp_bars[warp_id], 32);
         asm volatile("fence.proxy.async.shared::cta;");
@@ -313,7 +316,7 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
     }
   }
 }
-template <typename scalar_t=__half, const int THREADS_IN_ONE_BLOCK=512, const int OUTPUTS_IN_THREAD=8, const int OUTPUTS_SHIFT=3>
+template <typename scalar_t=__half, const int OUTPUTS_IN_THREAD=8, const int OUTPUTS_SHIFT=3>
 void ms_deformable_im2col_cuda(cudaStream_t stream, const scalar_t *data_value,
                                const int64_t *data_spatial_shapes,
                                const int64_t *data_level_start_index,
