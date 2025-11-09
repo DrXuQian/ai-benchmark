@@ -69,7 +69,7 @@ struct PointMeta {
     int32_t hLow, wLow, hHigh, wHigh;
 };
 
-// cp.async load helper: issue async load to specific stage buffer
+// cp.async load helper: issue async load to specific stage buffer using real cp.async API
 template<typename scalar_t, int STAGES, int CHANNELS, int NUMBERS_OF_WARPS, int QUERIES_PER_WARP>
 __device__ __forceinline__ void issue_cp_async_load(
     int stage_idx,
@@ -88,23 +88,22 @@ __device__ __forceinline__ void issue_cp_async_load(
     if (within_range) {
         const int hStride = spatial_w * CHANNELS;
         const int wStride = CHANNELS;
-        
+
         // Each thread loads part of the tile
         const int c_offset = (lane_id >> 2) * 4;
         const int spatial_offset = lane_id & 0x3;
         const int h_offset = spatial_offset >> 1;
         const int w_offset = spatial_offset & 0x1;
-        
+
         const int h_actual = hLow + h_offset;
         const int w_actual = wLow + w_offset;
-        
+
         if (h_actual >= 0 && h_actual < spatial_h && w_actual >= 0 && w_actual < spatial_w) {
             const scalar_t* src = data_value_ptr + h_actual * hStride + w_actual * wStride + c_offset;
             scalar_t* dst = &smem_tile[stage_idx][warp_id][query_id_in_warp][h_offset * 2 + w_offset][c_offset];
 
-            // Use simple vector load/store for 4 fp16 values (8 bytes)
-            float2 tmp = *reinterpret_cast<const float2*>(src);
-            *reinterpret_cast<float2*>(dst) = tmp;
+            // Use real cp.async API for 8 bytes (4 fp16 values)
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" :: "r"((uint32_t)__cvta_generic_to_shared(dst)), "l"(src));
         } else {
             scalar_t* dst = &smem_tile[stage_idx][warp_id][query_id_in_warp][h_offset * 2 + w_offset][c_offset];
             #pragma unroll
@@ -119,15 +118,17 @@ __device__ __forceinline__ void issue_cp_async_load(
         #pragma unroll
         for (int i = 0; i < 4; i++) dst[i] = __float2half(0.0f);
     }
-    __syncwarp();
 }
 
-// Wait for cp.async load to complete - just sync warp
+// Wait for cp.async load to complete - use cp.async.wait_group with proper depth
 template<int STAGES, int NUMBERS_OF_WARPS>
 __device__ __forceinline__ void wait_cp_async_load(
     int stage_idx,
     int warp_id)
 {
+    // Wait for the oldest pending cp.async group to complete
+    // With STAGES=2, we keep 1 group in flight (STAGES-1)
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(STAGES - 2));
     __syncwarp();
 }
 
@@ -231,6 +232,8 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
               cur_point_meta.within_range,
               cur_point_meta.hLow, cur_point_meta.wLow,
               spatial_h, spatial_w, data_value_ptr, smem_tile);
+          // Commit cp.async group after issuing load
+          asm volatile("cp.async.commit_group;\n" ::);
       }
 
       #pragma unroll
@@ -258,6 +261,8 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
                 next_point_meta.within_range,
                 next_point_meta.hLow, next_point_meta.wLow,
                 spatial_h, spatial_w, data_value_ptr, smem_tile);
+            // Commit cp.async group after issuing load
+            asm volatile("cp.async.commit_group;\n" ::);
         }
         wait_cp_async_load<STAGES, number_of_warps>(cur_stage_id, warp_id);
 
