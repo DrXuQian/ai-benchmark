@@ -63,72 +63,9 @@ __device__ inline void debug_print_tma_smem_comparison(
     }
 }
 
-// TMA load helper: issue async load to specific stage buffer
-template<typename scalar_t, int CHANNELS, int MAX_WARPS>
-__device__ __forceinline__ void issue_tma_load(
-    int stage_idx,
-    int warp_id,
-    int query_id_in_warp,
-    int is_loader_thread,
-    int within_range,
-    int hLow,
-    int wLow,
-    const CUtensorMap* tma_desc,
-    scalar_t smem_tile[][MAX_WARPS][8][2][2][CHANNELS],
-    cuda::barrier<cuda::thread_scope_block> warp_bars[][MAX_WARPS])
-{
-    if (is_loader_thread and within_range) {
-        // TMA coordinates: X=C, Y=W, Z=H
-        int32_t tensor_coord_c = 0;
-        int32_t tensor_coord_w = wLow;
-        int32_t tensor_coord_h = hLow;
-
-        // Issue TMA load to the specified stage
-        asm volatile(
-            "{\n\t"
-            "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
-            " [%0], [%1, {%2, %3, %4}], [%5];\n\t"
-            "}"
-            :
-            : "r"(static_cast<unsigned>(__cvta_generic_to_shared(&smem_tile[stage_idx][warp_id][query_id_in_warp][0][0][0]))),
-              "l"(reinterpret_cast<uint64_t>(tma_desc)),
-              "r"(tensor_coord_c), "r"(tensor_coord_w), "r"(tensor_coord_h),
-              "r"(static_cast<unsigned>(__cvta_generic_to_shared(&warp_bars[stage_idx][warp_id])))
-            : "memory"
-        );
-
-        asm volatile(
-            "mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;\n\t"
-            :
-            : "r"(static_cast<unsigned>(__cvta_generic_to_shared(&warp_bars[stage_idx][warp_id]))),
-              "n"(2 * 2 * CHANNELS * sizeof(scalar_t))
-        );
-    } else {
-        // Out of bounds - expect 0 bytes
-        asm volatile(
-            "mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;\n\t"
-            :
-            : "r"(static_cast<unsigned>(__cvta_generic_to_shared(&warp_bars[stage_idx][warp_id]))),
-              "n"(0)
-        );
-    }
-}
-
-// Wait for TMA load to complete for specific stage
-template<int MAX_WARPS>
-__device__ __forceinline__ void wait_tma_load(
-    int stage_idx,
-    int warp_id,
-    cuda::barrier<cuda::thread_scope_block> warp_bars[][MAX_WARPS])
-{
-    __syncwarp();
-    cuda::barrier<cuda::thread_scope_block>::arrival_token token = warp_bars[stage_idx][warp_id].arrive();
-    warp_bars[stage_idx][warp_id].wait(std::move(token));
-}
-
-template <typename scalar_t=__half, const int NUM_POINT= 8, const int NUM_LEVELS=4, const int CHANNELS = 32,
+template <typename scalar_t=__half, const int NUM_POINT= 8, const int NUM_LEVELS=4, const int CHANNELS = 32, 
                                     const int POINT_SHIFT=3, const int LEVEL_SHIFT=2, const int CHANNELS_SHIFT=5,
-                                    const int NUM_OUTPUT=8, const int NUM_OUTPUT_SHIFT=3, const int STAGES=2>
+                                    const int NUM_OUTPUT=8, const int NUM_OUTPUT_SHIFT=3, const int STAGES=1>
 __global__ void ms_deformable_im2col_gpu_kernel_template(
     const int n, const scalar_t *data_value, const int64_t *data_spatial_shapes,
     const int64_t *data_level_start_index, const scalar_t *data_sampling_loc,
@@ -167,20 +104,13 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
     const int is_loader_thread = lane_id % 4 == 0;
     // const int n_warp = blockDim.x / 32;
     // const int query_in_warp = 32 / (CHANNELS / NUM_OUTPUT);
-    // Use 256 threads (8 warps) instead of 512 (16 warps) to reduce shared memory usage
-    // This allows STAGES=2 to fit within 48KB limit
-    constexpr int MAX_WARPS = 8;  // 256 threads / 32 = 8 warps
-    __shared__ alignas(128) scalar_t smem_tile[STAGES][MAX_WARPS][8][2][2][CHANNELS];
+    __shared__ alignas(128) scalar_t smem_tile[STAGES][16][8][2][2][CHANNELS];  // max 512 threads = 16 warps, 8 queries per warp
 
-    // Per-warp, per-stage barriers for multi-stage pipelining
-    // Dimensions: [STAGES][8 warps]
+    // Per-warp barriers - FIXED: 16 barriers for 16 warps (was 8, causing out-of-bounds access!)
     #pragma nv_diag_suppress static_var_with_dynamic_init
-    __shared__ barrier warp_bars[STAGES][MAX_WARPS];
+    __shared__ barrier warp_bars[16];
     if (lane_id == 0) {
-        #pragma unroll
-        for (int s = 0; s < STAGES; s++) {
-            init(&warp_bars[s][warp_id], 32);
-        }
+        init(&warp_bars[warp_id], 32);
         asm volatile("fence.proxy.async.shared::cta;");
     }
 
@@ -230,79 +160,67 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
       }
       data_loc_w_ptr += (NUM_POINT << 1);
       data_weight_ptr += NUM_POINT;
-
-      // Pre-compute all point coordinates and metadata before pipelining
-      struct PointMeta {
-          half2 loc;
-          scalar_t weight;
-          half2 weighthalf2;
-          scalar_t h_im, w_im;
-          int within_range;
-          int32_t hLow, wLow, hHigh, wHigh;
-      };
-      PointMeta point_meta[NUM_POINT];
-
       #pragma unroll
-      for (int p = 0; p < NUM_POINT; ++p) {
-          point_meta[p].loc = loc_hw_vec[p];
-          point_meta[p].weight = weight_vec[p];
-          point_meta[p].weighthalf2 = half2(weight_vec[p], weight_vec[p]);
-          half2 hw_im = __hfma2(point_meta[p].loc, spatail_hw, zp5);
-          point_meta[p].h_im = __high2half(hw_im);
-          point_meta[p].w_im = __low2half(hw_im);
-          point_meta[p].within_range = (point_meta[p].h_im > (scalar_t)(0) &&
-                                        point_meta[p].w_im > (scalar_t)(0) &&
-                                        point_meta[p].h_im < (scalar_t)(spatial_h + 1) &&
-                                        point_meta[p].w_im < (scalar_t)(spatial_w + 1));
-          point_meta[p].hLow = __half2int_rd(point_meta[p].h_im);
-          point_meta[p].wLow = __half2int_rd(point_meta[p].w_im);
-          point_meta[p].hHigh = point_meta[p].hLow + 1;
-          point_meta[p].wHigh = point_meta[p].wLow + 1;
-      }
-
-      const int desc_idx = b_col * NUM_LEVELS + l_col;
-      const CUtensorMap* tma_desc = &d_tma_descs[desc_idx];
-
-      // ===== Multi-stage software pipelining =====
-      // Prologue: fill the pipeline with STAGES-1 loads
-      #pragma unroll
-      for (int p = 0; p < STAGES - 1 && p < NUM_POINT; ++p) {
-          int stage_idx = p % STAGES;
-          issue_tma_load<scalar_t, CHANNELS, MAX_WARPS>(
-              stage_idx, warp_id, query_id_in_warp,
-              is_loader_thread, point_meta[p].within_range,
-              point_meta[p].hLow, point_meta[p].wLow,
-              tma_desc, smem_tile, warp_bars);
-      }
-
-      // Main loop: overlap compute of stage i with load of stage (i + STAGES - 1)
       for (int p_col = 0; p_col < NUM_POINT; ++p_col) {
-          int compute_stage = p_col % STAGES;
-          int prefetch_p = p_col + STAGES - 1;
+        const half2 loc = loc_hw_vec[p_col];
+        const scalar_t weight = weight_vec[p_col];
+        half2 weighthalf2 = half2(weight, weight);
+        half2 hw_im = __hfma2(loc, spatail_hw, zp5);
+        scalar_t h_im = __high2half(hw_im);
+        scalar_t w_im = __low2half(hw_im);
 
-          // Prefetch next point if available
-          if (prefetch_p < NUM_POINT) {
-              int prefetch_stage = prefetch_p % STAGES;
-              issue_tma_load<scalar_t, CHANNELS, MAX_WARPS>(
-                  prefetch_stage, warp_id, query_id_in_warp,
-                  is_loader_thread, point_meta[prefetch_p].within_range,
-                  point_meta[prefetch_p].hLow, point_meta[prefetch_p].wLow,
-                  tma_desc, smem_tile, warp_bars);
-          }
+        const int within_range = (h_im > (scalar_t)(0) && 
+                                  w_im > (scalar_t)(0) && 
+                                  h_im < (scalar_t)(spatial_h + 1) && 
+                                  w_im < (scalar_t)(spatial_w + 1));
+        int32_t const hLow = __half2int_rd(h_im);
+        int32_t const wLow = __half2int_rd(w_im);
+        int32_t const hHigh = hLow + 1;
+        int32_t const wHigh = wLow + 1;
 
-          // Wait for current stage's TMA to complete
-          wait_tma_load<MAX_WARPS>(compute_stage, warp_id, warp_bars);
+        if (is_loader_thread and within_range) {
+            // TMA coordinates: X=C, Y=W, Z=H
+            int32_t tensor_coord_c = 0;
+            int32_t tensor_coord_w = wLow;
+            int32_t tensor_coord_h = hLow;
 
-          // Use metadata from point_meta array
-          const auto& pm = point_meta[p_col];
-          half2 weighthalf2 = pm.weighthalf2;  // Remove const for HALF2 macro
-          const int within_range = pm.within_range;
-          const int32_t hLow = pm.hLow;
-          const int32_t wLow = pm.wLow;
-          const int32_t hHigh = pm.hHigh;
-          const int32_t wHigh = pm.wHigh;
-          const scalar_t h_im = pm.h_im;
-          const scalar_t w_im = pm.w_im;
+            // Select correct TMA descriptor for this batch and level
+            // Index: batch * NUM_LEVELS + level
+            const int desc_idx = b_col * NUM_LEVELS + l_col;
+            const CUtensorMap* tma_desc = &d_tma_descs[desc_idx];
+
+            // Issue TMA load for this level
+            asm volatile(
+                "{\n\t"
+                "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
+                " [%0], [%1, {%2, %3, %4}], [%5];\n\t"
+                "}"
+                :
+                : "r"(static_cast<unsigned>(__cvta_generic_to_shared(&smem_tile[0][warp_id][query_id_in_warp][0][0][0]))),
+                "l"(reinterpret_cast<uint64_t>(tma_desc)),
+                "r"(tensor_coord_c), "r"(tensor_coord_w), "r"(tensor_coord_h),
+                "r"(static_cast<unsigned>(__cvta_generic_to_shared(&warp_bars[warp_id])))
+                : "memory"
+            );
+
+            asm volatile(
+                "mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;\n\t"
+                :
+                : "r"(static_cast<unsigned>(__cvta_generic_to_shared(&warp_bars[warp_id]))),
+                    "n"(2 * 2 * 32 * sizeof(scalar_t))
+            );
+        }else {
+            asm volatile(
+                "mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;\n\t"
+                :
+                : "r"(static_cast<unsigned>(__cvta_generic_to_shared(&warp_bars[warp_id]))),
+                    "n"(0)
+            );
+        }
+        __syncwarp();
+        // Warp waits for this level's TMA to complete
+        barrier::arrival_token token = warp_bars[warp_id].arrive();
+        warp_bars[warp_id].wait(std::move(token));
 
         if (within_range){
             const __half lh = __hsub(h_im, __int2half_rd(hLow));
@@ -325,9 +243,8 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
             HALF2(wdataexp[0]) = __hmul2(half2(wdata[0],  wdata[0]), HALF2(weighthalf2));
             #pragma unroll
             for (int j = 0; j < NUM_OUTPUT; j += 8){
-                // Load from TMA shared memory (use current compute_stage)
-                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[compute_stage][warp_id][query_id_in_warp][0][0][c_col + j]);
-
+                // Load from TMA shared memory for comparison
+                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[0][warp_id][query_id_in_warp][0][0][c_col + j]);
                 // Debug: Compare TMA vs global memory for ptr1 (h=hLow, w=wLow)
                 if (DEBUG) {
                     // Load from global memory (current implementation)
@@ -335,7 +252,6 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
                     debug_print_tma_smem_comparison(tid, b_col, l_col, p_col, blockIdx.x,
                                                      vdata2d, vdata2d_tma, 1, hLow, wLow, c_col, NUM_OUTPUT);
                 }
-
                 #pragma unroll
                 for (int p = 0; p < 8; p += 2){
                     HALF2(col[p]) = __hfma2(HALF2(wdataexp[0]), HALF2(vdata2d_tma[p]), HALF2(col[p]));
@@ -345,7 +261,7 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
             int32_t const ptr2 = hLowPtrOffset + wHighPtrOffset + c_col;
             #pragma unroll
             for (int j = 0; j < NUM_OUTPUT; j += 8){
-                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[compute_stage][warp_id][query_id_in_warp][0][1][c_col + j]);
+                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[0][warp_id][query_id_in_warp][0][1][c_col + j]);
                 if (DEBUG) {
                     LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(data_value_ptr)[ptr2 + j]);
                     debug_print_tma_smem_comparison(tid, b_col, l_col, p_col, blockIdx.x,
@@ -360,7 +276,7 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
             HALF2(wdataexp[0]) = __hmul2(half2(wdata[2],  wdata[2]), HALF2(weighthalf2));
             #pragma unroll
             for (int j = 0; j < NUM_OUTPUT; j += 8){
-                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[compute_stage][warp_id][query_id_in_warp][1][0][c_col + j]);
+                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[0][warp_id][query_id_in_warp][1][0][c_col + j]);
                 if (DEBUG) {
                     LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(data_value_ptr)[ptr3 + j]);
                     debug_print_tma_smem_comparison(tid, b_col, l_col, p_col, blockIdx.x,
@@ -375,7 +291,7 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
             HALF2(wdataexp[0]) = __hmul2(half2(wdata[3],  wdata[3]), HALF2(weighthalf2));
             #pragma unroll
             for (int j = 0; j < NUM_OUTPUT; j += 8){
-                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[compute_stage][warp_id][query_id_in_warp][1][1][c_col + j]);
+                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[0][warp_id][query_id_in_warp][1][1][c_col + j]);
                 if (DEBUG) {
                     LDST128BITS(vdata2d[j]) = LDST128BITS(const_cast<__half*>(data_value_ptr)[ptr4 + j]);
                     debug_print_tma_smem_comparison(tid, b_col, l_col, p_col, blockIdx.x,
@@ -387,7 +303,7 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
                 }
             }
         }
-      }  // End of pipelined point loop
+      }
     }
     #pragma unroll
     for (int idx = 0; idx < NUM_OUTPUT; idx += 8){
@@ -397,7 +313,7 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
     }
   }
 }
-template <typename scalar_t=__half, const int THREADS_IN_ONE_BLOCK=256, const int OUTPUTS_IN_THREAD=8, const int OUTPUTS_SHIFT=3>
+template <typename scalar_t=__half, const int THREADS_IN_ONE_BLOCK=512, const int OUTPUTS_IN_THREAD=8, const int OUTPUTS_SHIFT=3>
 void ms_deformable_im2col_cuda(cudaStream_t stream, const scalar_t *data_value,
                                const int64_t *data_spatial_shapes,
                                const int64_t *data_level_start_index,
@@ -409,32 +325,11 @@ void ms_deformable_im2col_cuda(cudaStream_t stream, const scalar_t *data_value,
                                const int num_point, const CUtensorMap* d_tma_descs, scalar_t *data_col) {
   const int num_kernels = batch_size * num_query * num_heads * channels / OUTPUTS_IN_THREAD;
   const int num_actual_kernels = batch_size * num_query * num_heads * channels / OUTPUTS_IN_THREAD;
-  // 8 warps (256 threads) to fit STAGES=2 within 48KB shared memory limit
+  // 8 warp, optimal threads for MIG 
   const int num_threads = THREADS_IN_ONE_BLOCK;
   if (num_heads == 1 and num_point == 8 and num_levels == 4 and channels == 32){
-        // Define kernel function pointer for attribute setting
-        auto kernel = ms_deformable_im2col_gpu_kernel_template<scalar_t, 8, 4, 32, 3, 2, 5, OUTPUTS_IN_THREAD, OUTPUTS_SHIFT>;
-
-        // Request larger shared memory for multi-stage pipelining
-        // STAGES=2 requires ~65 KB, default is 48 KB, request 96 KB to be safe
-        cudaError_t attr_err = cudaFuncSetAttribute(
-            kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            96 * 1024  // 96 KB
-        );
-        if (attr_err != cudaSuccess) {
-            printf("Warning: Failed to set shared memory size: %s\n", cudaGetErrorString(attr_err));
-            printf("Continuing with default shared memory limit...\n");
-        }
-
-        // Also set preferred shared memory carveout for better performance
-        cudaFuncSetAttribute(
-            kernel,
-            cudaFuncAttributePreferredSharedMemoryCarveout,
-            cudaSharedmemCarveoutMaxShared  // Maximize shared memory vs L1 cache
-        );
-
-        kernel<<<GET_BLOCKS(num_actual_kernels, num_threads), num_threads, 0, stream>>>(
+        ms_deformable_im2col_gpu_kernel_template<scalar_t, 8, 4, 32, 3, 2, 5, OUTPUTS_IN_THREAD, OUTPUTS_SHIFT>
+          <<<GET_BLOCKS(num_actual_kernels, num_threads), num_threads, 0, stream>>>(
               num_kernels, data_value, data_spatial_shapes, data_level_start_index,
               data_sampling_loc, data_attn_weight, batch_size, spatial_size,
               num_query, d_tma_descs, data_col);
