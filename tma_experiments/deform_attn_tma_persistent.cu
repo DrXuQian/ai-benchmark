@@ -86,7 +86,7 @@ __device__ __forceinline__ void issue_tma_load(
     int hLow,
     int wLow,
     const CUtensorMap* tma_desc,
-    scalar_t smem_tile[STAGES][NUMBERS_OF_WARPS][QUERIES_PER_WARP][2*2+1][CHANNELS],
+    scalar_t smem_tile[STAGES][NUMBERS_OF_WARPS][QUERIES_PER_WARP][2*2][CHANNELS],
     cuda::barrier<cuda::thread_scope_block> warp_bars[STAGES][NUMBERS_OF_WARPS])
 {
     if (is_loader_thread and within_range) {
@@ -186,7 +186,7 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
     // Padding: merge [2][2] into [5] to avoid bank conflicts while maintaining alignment
     // Original: [queries][2][2][32] = queries * 256 bytes (stride causes 8-way conflict)
     // Now: [queries][5][32] with padding, only use indices [0-3] for [h][w] combinations
-    __shared__ alignas(128) scalar_t smem_tile[STAGES][number_of_warps][queries_per_warp][2*2+1][CHANNELS];
+    __shared__ alignas(128) scalar_t smem_tile[STAGES][number_of_warps][queries_per_warp][2*2][CHANNELS];
     __shared__ barrier warp_bars[STAGES][number_of_warps];
     if (lane_id == 0) {
         for (int s = 0; s < STAGES; s ++){
@@ -313,41 +313,32 @@ __global__ void ms_deformable_im2col_gpu_kernel_template(
             // // expand wdata from [w0, w1, w2, w3] to  [w0, w0, w1, w1, w2, w2, ..., w3, w3]
             __half wdataexp[2];
             __half vdata2d_tma[NUM_OUTPUT];  // For TMA loaded data comparison
-            HALF2(wdataexp[0]) = __hmul2(half2(wdata[0],  wdata[0]), HALF2(weighthalf2));
-            #pragma unroll
-            for (int j = 0; j < NUM_OUTPUT; j += 8){
-                // Load from TMA shared memory for comparison
-                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[cur_stage_id][warp_id][query_id_in_warp][0][c_col + j]);
-                #pragma unroll
-                for (int p = 0; p < 8; p += 2){
-                    HALF2(col[p]) = __hfma2(HALF2(wdataexp[0]), HALF2(vdata2d_tma[p]), HALF2(col[p]));
-                }
+
+            // Bank conflict avoidance: interleaved access pattern
+            // Thread group 0-3: access order [0,1,2,3]
+            // Thread group 4-7: access order [1,0,3,2]
+            // Thread group 8-11: access order [0,1,2,3]
+            // Thread group 12-15: access order [1,0,3,2]
+            // Pattern repeats every 8 threads (2 groups of 4)
+            const int thread_group = (query_id_in_warp / 4) % 2;
+            int access_order[4];
+            if (thread_group == 0) {
+                access_order[0] = 0; access_order[1] = 1; access_order[2] = 2; access_order[3] = 3;
+            } else {
+                access_order[0] = 1; access_order[1] = 0; access_order[2] = 3; access_order[3] = 2;
             }
-            HALF2(wdataexp[0]) = __hmul2(half2(wdata[1],  wdata[1]), HALF2(weighthalf2));
+
             #pragma unroll
-            for (int j = 0; j < NUM_OUTPUT; j += 8){
-                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[cur_stage_id][warp_id][query_id_in_warp][1][c_col + j]);
+            for (int access_idx = 0; access_idx < 4; ++access_idx) {
+                int spatial_idx = access_order[access_idx];
+                HALF2(wdataexp[0]) = __hmul2(half2(wdata[spatial_idx], wdata[spatial_idx]), HALF2(weighthalf2));
                 #pragma unroll
-                for (int p = 0; p < 8; p += 2){
-                    HALF2(col[p]) = __hfma2(HALF2(wdataexp[0]), HALF2(vdata2d_tma[p]), HALF2(col[p]));
-                }
-            }
-            HALF2(wdataexp[0]) = __hmul2(half2(wdata[2],  wdata[2]), HALF2(weighthalf2));
-            #pragma unroll
-            for (int j = 0; j < NUM_OUTPUT; j += 8){
-                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[cur_stage_id][warp_id][query_id_in_warp][2][c_col + j]);
-                #pragma unroll
-                for (int p = 0; p < 8; p += 2){
-                    HALF2(col[p]) = __hfma2(HALF2(wdataexp[0]), HALF2(vdata2d_tma[p]), HALF2(col[p]));
-                }
-            }
-            HALF2(wdataexp[0]) = __hmul2(half2(wdata[3],  wdata[3]), HALF2(weighthalf2));
-            #pragma unroll
-            for (int j = 0; j < NUM_OUTPUT; j += 8){
-                LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[cur_stage_id][warp_id][query_id_in_warp][3][c_col + j]);
-                #pragma unroll
-                for (int p = 0; p < 8; p += 2){
-                    HALF2(col[p]) = __hfma2(HALF2(wdataexp[0]), HALF2(vdata2d_tma[p]), HALF2(col[p]));
+                for (int j = 0; j < NUM_OUTPUT; j += 8){
+                    LDST128BITS(vdata2d_tma[j]) = LDST128BITS(smem_tile[cur_stage_id][warp_id][query_id_in_warp][spatial_idx][c_col + j]);
+                    #pragma unroll
+                    for (int p = 0; p < 8; p += 2){
+                        HALF2(col[p]) = __hfma2(HALF2(wdataexp[0]), HALF2(vdata2d_tma[p]), HALF2(col[p]));
+                    }
                 }
             }
         }
