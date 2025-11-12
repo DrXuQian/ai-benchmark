@@ -35,7 +35,6 @@ __pycache__/
 # Test outputs
 *.log
 *.bin
-!tma_experiments/working/*.bin
 
 # Compiled TMA experiments
 tma_experiments/benchmark_all
