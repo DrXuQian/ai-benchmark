@@ -333,6 +333,12 @@ int main(int argc, char* argv[]) {
     }
     std::cout << " ]\n";
 
+    // Save output to file
+    std::ofstream outfile(data_dir + "/output_cuda_original.bin", std::ios::binary);
+    outfile.write(reinterpret_cast<const char*>(h_output.data()), h_output.size() * sizeof(__half));
+    outfile.close();
+    std::cout << "Output saved to " << data_dir << "/output_cuda_original.bin" << std::endl;
+
     // === 7. 释放所有 GPU 内存 ===
     std::cout << "Freeing GPU memory..." << std::endl;
     cudaFree(d_value);
